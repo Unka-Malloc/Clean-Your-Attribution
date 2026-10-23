@@ -497,10 +497,14 @@ pub struct RulesetRule {
 impl Policy {
     /// RE2 rules for the GitHub ruleset — generated from the catalogue so
     /// the JSON stays the single source and never drifts from what the
-    /// binaries enforce. Message rules mirror the full-domain matching:
-    /// any `Key:` line, bare `Name <addr>` lines, bare addresses and
-    /// generated-with badges; author/committer rules deny the verified
-    /// addresses in the identity fields themselves.
+    /// binaries enforce. The message rules are a deliberate safe subset of
+    /// the local classifier: `*-by` keys with identity-shaped or
+    /// exact-name values, bare `Name <email>` identity lines, bare denied
+    /// addresses, and generated-with badges whose label matches (shapes
+    /// stay inside the label, so URLs cannot fire). Exotic non-`-by`
+    /// trailer keys are a documented server-side gap the CLI still
+    /// catches; author/committer rules deny the verified addresses in the
+    /// identity fields themselves.
     pub fn ruleset_patterns(&self) -> Vec<RulesetRule> {
         let mut names: Vec<String> = self
             .agents
