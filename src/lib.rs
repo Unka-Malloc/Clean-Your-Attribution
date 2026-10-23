@@ -585,7 +585,8 @@ impl Policy {
         // Non-blank char = outside Unicode White_Space and not the line
         // separator. UCD White_Space minus U+000A:
         // 0009 000B-000D 0020 0085 00A0 1680 2000-200A 2028 2029 202F 205F 3000
-        let nonblank = "[^\\x09\\x0B-\\x0D\\x20\\x85\\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]";
+        // Escapes use \x{NNNN}: RE2 rejects the fixed-width \uNNNN form.
+        let nonblank = "[^\\x09\\x0B-\\x0D\\x20\\x85\\xA0\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]";
         let after_subject = format!("{nonblank}[\\s\\S]*?\\n");
         let canonical_alt = self
             .trailer_keys
@@ -686,7 +687,9 @@ impl Policy {
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny agent-shaped addresses in -by trailer brackets".into(),
-                pattern: format!("(?im){after_subject}{by_key}:[^<\\n]*<[^@>\\n]*(?:{shape_addr_alt})[^@>\\n]*@"),
+                pattern: format!(
+                    "(?im){after_subject}{by_key}:[^<\\n]*<[^@>\\n]*(?:{shape_addr_alt})[^@>\\n]*@"
+                ),
             });
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
@@ -965,10 +968,7 @@ mod tests {
             // Safe idioms: `[^\S\n]` (whitespace minus newline — RE2's ASCII
             // set only shrinks matches) and `[\s\S]` (the class unioned with
             // its own complement — every char under either semantics).
-            let without_negated = r
-                .pattern
-                .replace("[^\\S\\n]", "")
-                .replace("[\\s\\S]", "");
+            let without_negated = r.pattern.replace("[^\\S\\n]", "").replace("[\\s\\S]", "");
             assert!(
                 !without_negated.contains("\\S"),
                 "ruleset rule {} uses \\S — RE2 ASCII semantics diverge: {}",
