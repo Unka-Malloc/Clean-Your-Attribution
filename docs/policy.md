@@ -20,17 +20,30 @@ or `github.com/factory-droid` that merely *look* like the agent's name.
 | `agents[].addresses` | string[] | Verified attribution emails. `users.noreply.github.com` entries match on the login local part, so any `<id>+<login>` variant of the same account is covered. |
 | `unverified[]` | object[] | Transparency list of identities seen in the wild but not yet verified — **not** denied. Includes real humans who must never be added. |
 
-## Match semantics
+## Match semantics — full domain
 
-- `Key: Name <addr>` trailer lines deny when `name` or `addr` hits an agent
-  entry. `Generated-by:` / `Assisted-by:` values without `<>` match by name.
-- `… Generated with <name>` footer lines deny when the badge text names an
-  agent entry.
+A verified identity is denied **wherever it appears in complete form**:
+
+- **Author and committer fields.** Agents sign commits directly —
+  `copilot-swe-agent[bot]`, `factory-droid[bot]` and `devin-ai-integration[bot]`
+  author commits with no trailer at all. `cya scan` reports them;
+  `cya clean` rewrites the field to the repository's own `user.name` /
+  `user.email`, so the human operator takes ownership.
+- **Any `Key:` line**, not only the canonical attribution keys:
+  `Co-authored-by`, `Signed-off-by`, `Reviewed-by`, or whatever key a tool
+  invents — the value is matched by name or address.
+- **Bare `Name <addr>` lines and bare-address lines** anywhere in the
+  message, plus `… Generated with <name>` badge lines.
 - Indented lines never match: a body quoting a trailer as an example keeps
   it. Wrapped continuation lines of a denied trailer are removed with it.
-- Everything else survives verbatim: `Signed-off-by`, `Reviewed-by`, human
-  co-authors on any address, model ids that name no verified identity
+- Everything else survives verbatim: human co-authors on any address,
+  sign-offs by humans, model ids that name no verified identity
   (`Generated-by: gpt-5`).
+
+Server side, the same coverage maps to ruleset rule types: five
+`commit_message_pattern` rules plus `commit_author_email_pattern` and
+`committer_email_pattern` denying the verified addresses in the identity
+fields themselves.
 
 ## Ruleset generation
 

@@ -50,26 +50,18 @@ pub struct Agent {
 }
 
 pub struct Policy {
-    /// Trailer keys inspected for agent attribution, stored lowercased.
+    /// Trailer keys declared in the policy file — the canonical attribution
+    /// keys. Matching is broader than this list (any `Key:` line is
+    /// inspected); the field remains the preset-floor contract.
     pub trailer_keys: Vec<String>,
     pub agents: Vec<Agent>,
     pub source: String,
-    /// `Key:`-prefixed trailer line matcher built from trailer_keys.
-    trailer_line: Regex,
 }
 
 fn parse_policy(json: &str, source: &str) -> Result<Policy> {
     let raw: PolicyFile = serde_json::from_str(json).context("policy JSON invalid")?;
     ensure!(!raw.agents.is_empty(), "policy lists no agents");
     let trailer_keys: Vec<String> = raw.trailer_keys.iter().map(|k| k.to_lowercase()).collect();
-    let keys_alt = raw
-        .trailer_keys
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect::<Vec<_>>()
-        .join("|");
-    let trailer_line =
-        Regex::new(&format!("(?i)^({keys_alt}):\\s*(.*?)\\s*$")).context("bad trailerKeys")?;
     let mut agents = Vec::new();
     for spec in &raw.agents {
         ensure!(
@@ -88,7 +80,6 @@ fn parse_policy(json: &str, source: &str) -> Result<Policy> {
         trailer_keys,
         agents,
         source: source.into(),
-        trailer_line,
     })
 }
 
@@ -197,39 +188,56 @@ fn split_name_addr(value: &str) -> (&str, Option<&str>) {
     (value.trim(), None)
 }
 
+/// Any `Key: value` line — trailer keys beyond the canonical three carry
+/// attribution too (Signed-off-by, Reviewed-by, whatever a tool invents).
+static KEY_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*?)[ \t]*$").unwrap());
 static GENERATED_WITH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^[^\w\s]{0,3}\s*generated\s+with\s+").unwrap());
 
+/// The agent id a `name <addr>` pair or a bare name/addr resolves to.
+fn find_agent(name: &str, addr: Option<&str>, policy: &Policy) -> Option<String> {
+    policy
+        .agents
+        .iter()
+        .find(|a| name_matches(name, a) || addr.is_some_and(|x| addr_matches(x, a)))
+        .map(|a| a.id.clone())
+}
+
 /// The agent id a single line attributes work to, if it is a denied
-/// attribution line. Indented lines never match — a body quoting a trailer
-/// as an example keeps it. `None` means the line stays.
+/// attribution line — a `Key: Name <addr>` trailer of ANY key, a bare
+/// `Name <addr>` or bare-address full line, or a `Generated with <name>`
+/// badge. Indented lines never match: a body quoting a trailer as an
+/// example keeps it. `None` means the line stays.
 fn attribution_agent(line: &str, policy: &Policy) -> Option<String> {
     if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
         return None;
     }
-    if let Some(caps) = policy.trailer_line.captures(line) {
+    if let Some(caps) = KEY_LINE.captures(line) {
         let (name, addr) = split_name_addr(&caps[2]);
-        return policy
-            .agents
-            .iter()
-            .find(|a| name_matches(name, a) || addr.is_some_and(|x| addr_matches(x, a)))
-            .map(|a| a.id.clone());
+        return find_agent(name, addr, policy);
     }
     if let Some(m) = GENERATED_WITH.find(line) {
-        let rest = &line[m.end()..];
-        let inner = rest.trim_start_matches('[');
-        let name = inner
-            .split([']', '('])
-            .next()
-            .unwrap_or("")
-            .trim();
-        return policy
-            .agents
-            .iter()
-            .find(|a| name_matches(name, a))
-            .map(|a| a.id.clone());
+        let inner = line[m.end()..].trim_start_matches('[');
+        let name = inner.split([']', '(']).next().unwrap_or("").trim();
+        return find_agent(name, None, policy);
+    }
+    // Bare `Name <addr>` or bare address as the whole line.
+    let (name, addr) = split_name_addr(line.trim_end());
+    if addr.is_some() {
+        return find_agent(name, addr, policy);
+    }
+    if !line.contains(char::is_whitespace) && line.contains('@') {
+        return find_agent("", Some(line.trim()), policy);
     }
     None
+}
+
+/// The agent id a commit's author or committer field resolves to.
+/// Agents sign commits directly too — copilot-swe-agent[bot] and
+/// factory-droid[bot] author commits with no trailer at all.
+pub fn identity_agent(name: &str, email: &str, policy: &Policy) -> Option<String> {
+    find_agent(name.trim(), Some(email.trim()), policy)
 }
 
 // --------------------------------------------------------------- findings
@@ -247,15 +255,23 @@ pub struct PatternHit {
     pub text: String,
 }
 
+/// A hit in the author/committer fields rather than the message.
+pub struct IdentityHit {
+    pub field: &'static str,
+    pub agent: String,
+    pub text: String,
+}
+
 #[derive(Default)]
 pub struct Findings {
     pub trailers: Vec<TrailerHit>,
     pub patterns: Vec<PatternHit>,
+    pub identities: Vec<IdentityHit>,
 }
 
 impl Findings {
     pub fn total(&self) -> usize {
-        self.trailers.len() + self.patterns.len()
+        self.trailers.len() + self.patterns.len() + self.identities.len()
     }
 }
 
@@ -264,22 +280,17 @@ pub fn message_findings(message: &str, policy: &Policy) -> Findings {
     let mut findings = Findings::default();
     for (i, line) in normalized.split('\n').enumerate() {
         if let Some(agent) = attribution_agent(line, policy) {
-            let key = policy
-                .trailer_line
-                .captures(line)
-                .map(|c| c[1].to_string())
-                .unwrap_or_else(|| "generated-with".into());
-            if key.eq_ignore_ascii_case("generated-with") {
-                findings.patterns.push(PatternHit {
+            if let Some(caps) = KEY_LINE.captures(line) {
+                findings.trailers.push(TrailerHit {
                     line: i + 1,
-                    id: agent,
+                    key: caps[1].to_string(),
+                    agent,
                     text: line.trim().to_string(),
                 });
             } else {
-                findings.trailers.push(TrailerHit {
+                findings.patterns.push(PatternHit {
                     line: i + 1,
-                    key,
-                    agent,
+                    id: agent,
                     text: line.trim().to_string(),
                 });
             }
@@ -307,7 +318,7 @@ pub fn strip_denied(message: &str, policy: &Policy) -> (String, Vec<String>) {
             Some(agent) => {
                 removed.push(agent);
                 // Trailer values wrap onto indented continuation lines.
-                dropping = !indented && policy.trailer_line.is_match(line);
+                dropping = KEY_LINE.is_match(line);
             }
             None => kept.push(line),
         }
@@ -339,11 +350,23 @@ fn re2_escape(s: &str) -> String {
         .collect()
 }
 
+/// One ruleset rule: `rule_type` is the GitHub ruleset rule type
+/// (`commit_message_pattern`, `commit_author_email_pattern`,
+/// `committer_email_pattern`); `pattern` is RE2 with `negate: true`.
+pub struct RulesetRule {
+    pub rule_type: &'static str,
+    pub name: String,
+    pub pattern: String,
+}
+
 impl Policy {
-    /// RE2 patterns for GitHub ruleset `commit_message_pattern` (negate)
-    /// rules — generated from the catalogue so the JSON stays the single
-    /// source and never drifts from what the binaries enforce.
-    pub fn ruleset_patterns(&self) -> Vec<(String, String)> {
+    /// RE2 rules for the GitHub ruleset — generated from the catalogue so
+    /// the JSON stays the single source and never drifts from what the
+    /// binaries enforce. Message rules mirror the full-domain matching:
+    /// any `Key:` line, bare `Name <addr>` lines, bare addresses and
+    /// generated-with badges; author/committer rules deny the verified
+    /// addresses in the identity fields themselves.
+    pub fn ruleset_patterns(&self) -> Vec<RulesetRule> {
         let mut names: Vec<String> = self
             .agents
             .iter()
@@ -352,12 +375,6 @@ impl Policy {
         names.sort_by_key(|b| std::cmp::Reverse(b.len()));
         names.dedup();
         let names_alt = names.join("|");
-        let keys_alt = self
-            .trailer_keys
-            .iter()
-            .map(|k| re2_escape(k))
-            .collect::<Vec<_>>()
-            .join("|");
 
         // users.noreply.github.com local parts get an optional <id>+ prefix;
         // other domains match their exact verified address.
@@ -375,31 +392,59 @@ impl Policy {
         noreply.dedup();
         exact.sort();
         exact.dedup();
-        let mut addr_alt = vec![format!(
-            "(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com",
-            noreply.join("|")
-        )];
-        if !exact.is_empty() {
-            addr_alt.push(exact.join("|"));
-        }
-
-        let mut rules = vec![];
-        rules.push((
-            "deny listed agent names in attribution trailers".into(),
-            format!("(?im)^(?:{keys_alt}):\\s*(?:{names_alt})(?:$|[^A-Za-z0-9])"),
-        ));
-        rules.push((
-            "deny listed agent addresses in attribution trailers".into(),
+        let addr_alt = if exact.is_empty() {
+            format!("(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com", noreply.join("|"))
+        } else {
             format!(
-                "(?im)^(?:{keys_alt}):[^<\\n]*<(?:{})>",
-                addr_alt.join("|")
-            ),
-        ));
-        rules.push((
-            "deny generated-with badges naming listed agents".into(),
-            format!("(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with[^\\n]*(?:{names_alt})(?:$|[^A-Za-z0-9])"),
-        ));
-        rules
+                "(?:(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com|{})",
+                noreply.join("|"),
+                exact.join("|")
+            )
+        };
+
+        vec![
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny listed agent names in attribution lines".into(),
+                pattern: format!(
+                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                ),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny listed agent addresses in attribution lines".into(),
+                pattern: format!(
+                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[^<\\n]*<(?:{addr_alt})>"
+                ),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny bare agent name-address lines".into(),
+                pattern: format!("(?im)^(?:{names_alt})[ \\t]*<[^>\\n]*>"),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny bare agent address lines".into(),
+                pattern: format!("(?im)^<?(?:{addr_alt})>?[ \\t]*$"),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny generated-with badges naming listed agents".into(),
+                pattern: format!(
+                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with[^\\n]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                ),
+            },
+            RulesetRule {
+                rule_type: "commit_author_email_pattern",
+                name: "deny listed agent author addresses".into(),
+                pattern: format!("(?i)^{addr_alt}$"),
+            },
+            RulesetRule {
+                rule_type: "committer_email_pattern",
+                name: "deny listed agent committer addresses".into(),
+                pattern: format!("(?i)^{addr_alt}$"),
+            },
+        ]
     }
 }
 
@@ -538,9 +583,43 @@ mod tests {
     }
 
     #[test]
+    fn full_domain_matching() {
+        // Any trailer key — not just the canonical three — denies.
+        for line in [
+            "Signed-off-by: codex <267193182+codex@users.noreply.github.com>",
+            "Reviewed-by: copilot-swe-agent[bot] <x@y.example>",
+            "X-Custom: Claude Code",
+        ] {
+            let (_, removed) = strip_denied(&format!("fix: t\n\n{line}\n"), &policy());
+            assert_eq!(removed.len(), 1, "line: {line}");
+        }
+        // Bare `Name <addr>` and bare-address full lines deny too.
+        let (_, removed) = strip_denied(
+            "fix: t\n\nfactory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>\n",
+            &policy(),
+        );
+        assert_eq!(removed, ["factory-droid"]);
+        let (_, removed) = strip_denied("fix: t\n\njules@google.com\n", &policy());
+        assert_eq!(removed, ["google-jules"]);
+        // Agent identities in author/committer fields deny.
+        assert_eq!(
+            identity_agent("copilot-swe-agent[bot]", "anything@users.noreply.github.com", &policy()),
+            Some("github-copilot".into())
+        );
+        assert_eq!(
+            identity_agent("Whoever", "267193182+codex@users.noreply.github.com", &policy()),
+            Some("openai-codex".into())
+        );
+        assert_eq!(
+            identity_agent("Jane Doe", "jane@corp.com", &policy()),
+            None
+        );
+    }
+
+    #[test]
     fn ruleset_patterns_compile() {
-        for (name, pat) in policy().ruleset_patterns() {
-            assert!(Regex::new(&pat).is_ok(), "ruleset pattern {name} invalid: {pat}");
+        for r in policy().ruleset_patterns() {
+            assert!(Regex::new(&r.pattern).is_ok(), "ruleset rule {} invalid: {}", r.name, r.pattern);
         }
     }
 

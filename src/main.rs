@@ -4,7 +4,9 @@
 //! `.github/workflows/sig-check.yml`.
 
 use anyhow::{Context, Result};
-use attribution_gate::{Findings, Policy, load_policy, message_findings, strip_denied};
+use attribution_gate::{
+    Findings, IdentityHit, Policy, identity_agent, load_policy, message_findings, strip_denied,
+};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -42,6 +44,9 @@ fn report(label: &str, findings: &Findings) -> usize {
     for p in &findings.patterns {
         eprintln!("  {label} L{}: {}  [{}]", p.line, p.text, p.id);
     }
+    for i in &findings.identities {
+        eprintln!("  {label} {}: {}  [{}]", i.field, i.text, i.agent);
+    }
     findings.total()
 }
 
@@ -55,16 +60,58 @@ fn default_range() -> String {
     "HEAD".into()
 }
 
-fn commits_in_range(range: &str) -> Result<Vec<(String, String)>> {
-    let out = git(&["log", "--format=%H%x00%B%x00", range])?;
-    let parts: Vec<&str> = out.split('\0').filter(|p| !p.is_empty()).collect();
+struct Commit {
+    sha: String,
+    author_name: String,
+    author_email: String,
+    author_date: String,
+    committer_name: String,
+    committer_email: String,
+    committer_date: String,
+    message: String,
+}
+
+fn commits_in_range(range: &str) -> Result<Vec<Commit>> {
+    let out = git(&[
+        "log",
+        "--format=%H%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B%x00",
+        range,
+    ])?;
+    let parts: Vec<&str> = out.split('\0').collect();
     let mut commits = Vec::new();
-    for pair in parts.chunks(2) {
-        if pair.len() == 2 {
-            commits.push((pair[0].trim().to_string(), pair[1].to_string()));
+    for chunk in parts.chunks(8) {
+        if chunk.len() == 8 && !chunk[0].trim().is_empty() {
+            commits.push(Commit {
+                sha: chunk[0].trim().to_string(),
+                author_name: chunk[1].to_string(),
+                author_email: chunk[2].to_string(),
+                author_date: chunk[3].trim().to_string(),
+                committer_name: chunk[4].to_string(),
+                committer_email: chunk[5].to_string(),
+                committer_date: chunk[6].trim().to_string(),
+                message: chunk[7].to_string(),
+            });
         }
     }
     Ok(commits)
+}
+
+/// Findings for one commit: message lines plus author/committer identity.
+fn commit_findings(c: &Commit, policy: &Policy) -> Findings {
+    let mut f = message_findings(&c.message, policy);
+    for (field, name, email) in [
+        ("author", c.author_name.as_str(), c.author_email.as_str()),
+        ("committer", c.committer_name.as_str(), c.committer_email.as_str()),
+    ] {
+        if let Some(agent) = identity_agent(name, email, policy) {
+            f.identities.push(IdentityHit {
+                field,
+                agent,
+                text: format!("{name} <{email}>"),
+            });
+        }
+    }
+    f
 }
 
 fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
@@ -91,11 +138,14 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
                 let base = try_git(&["merge-base", local_sha, "origin/HEAD"]).unwrap_or_else(|| "HEAD".into());
                 format!("{base}..{local_sha}")
             };
-            let commits = commits_in_range(&range).unwrap_or_else(|_| {
-                vec![(local_sha.into(), git(&["log", "-1", "--format=%B", local_sha]).unwrap_or_default())]
-            });
-            for (sha, message) in commits {
-                hits += report(&format!("{local_ref} {}", &sha[..sha.len().min(10)]), &message_findings(&message, policy));
+            let commits = commits_in_range(&range)
+                .or_else(|_| commits_in_range(local_sha))
+                .unwrap_or_default();
+            for c in &commits {
+                hits += report(
+                    &format!("{local_ref} {}", &c.sha[..c.sha.len().min(10)]),
+                    &commit_findings(c, policy),
+                );
             }
         }
         println!("{}", if hits > 0 { format!("pre-push: {hits} denied entr{} — run `cya clean`", if hits > 1 { "ies" } else { "y" }) } else { "pre-push: clean".into() });
@@ -104,8 +154,8 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
     let range = flag_value(argv, "--range").unwrap_or_else(default_range);
     let commits = commits_in_range(&range)?;
     let mut hits = 0;
-    for (sha, message) in &commits {
-        hits += report(&sha[..sha.len().min(10)], &message_findings(message, policy));
+    for c in &commits {
+        hits += report(&c.sha[..c.sha.len().min(10)], &commit_findings(c, policy));
     }
     println!(
         "{}",
@@ -159,6 +209,10 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
         .collect();
     anyhow::ensure!(!revs.is_empty(), "nothing to clean: {range} is empty");
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Denied author/committer fields are replaced by the repository's own
+    // identity — the human operator takes ownership of the rewritten commits.
+    let repo_name = try_git(&["config", "user.name"]).unwrap_or_else(|| "Unknown".into());
+    let repo_email = try_git(&["config", "user.email"]).unwrap_or_else(|| "unknown@localhost".into());
     let mut touched = 0usize;
     for rev in &revs {
         let line = git(&["rev-list", "--parents", "-n1", rev])?;
@@ -169,9 +223,12 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
             .iter()
             .map(|p| map.get(p).cloned().unwrap_or_else(|| p.clone()))
             .collect();
-        let message = git(&["log", "-1", "--format=%B", rev])?;
-        let (new_message, _removed) = strip_denied(&message, policy);
-        let unchanged = new_parents == parents && new_message == message;
+        let mut c = commits_in_range(rev)?.remove(0);
+        let (new_message, _removed) = strip_denied(&c.message, policy);
+        let author_denied = identity_agent(&c.author_name, &c.author_email, policy).is_some();
+        let committer_denied =
+            identity_agent(&c.committer_name, &c.committer_email, policy).is_some();
+        let unchanged = new_parents == parents && new_message == c.message && !author_denied && !committer_denied;
         let new_sha = if unchanged {
             rev.clone()
         } else {
@@ -182,17 +239,17 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
                 args.push("-p".into());
                 args.push(p.clone());
             }
-            for (k, v) in [
-                ("GIT_AUTHOR_NAME", try_git(&["log", "-1", "--format=%an", rev])),
-                ("GIT_AUTHOR_EMAIL", try_git(&["log", "-1", "--format=%ae", rev])),
-                ("GIT_AUTHOR_DATE", try_git(&["log", "-1", "--format=%aI", rev])),
-            ] {
-                if let Some(v) = v {
-                    std::env::set_var(k, v);
-                }
-            }
+            let envs = [
+                ("GIT_AUTHOR_NAME", if author_denied { &repo_name } else { &c.author_name }),
+                ("GIT_AUTHOR_EMAIL", if author_denied { &repo_email } else { &c.author_email }),
+                ("GIT_AUTHOR_DATE", &c.author_date),
+                ("GIT_COMMITTER_NAME", if committer_denied { &repo_name } else { &c.committer_name }),
+                ("GIT_COMMITTER_EMAIL", if committer_denied { &repo_email } else { &c.committer_email }),
+                ("GIT_COMMITTER_DATE", &c.committer_date),
+            ];
             let mut child = Command::new("git")
                 .args(&args)
+                .envs(envs.iter().map(|(k, v)| (k, v.as_str())))
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -204,6 +261,7 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
                 .write_all(new_message.as_bytes())?;
             let out = child.wait_with_output()?;
             anyhow::ensure!(out.status.success(), "commit-tree failed for {rev}");
+            c.message.clear();
             String::from_utf8(out.stdout)?.trim().to_string()
         };
         map.insert(rev.clone(), new_sha);
@@ -270,10 +328,11 @@ fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
             );
             anyhow::ensure!(!a.verify.is_empty(), "agent {:?} lacks a verify reference", a.id);
         }
-        for (name, pattern) in policy.ruleset_patterns() {
+        for r in policy.ruleset_patterns() {
             anyhow::ensure!(
-                regex::Regex::new(&pattern).is_ok(),
-                "ruleset pattern {name:?} does not compile"
+                regex::Regex::new(&r.pattern).is_ok(),
+                "ruleset rule {:?} does not compile",
+                r.name
             );
         }
         println!(
@@ -294,8 +353,8 @@ fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
             println!("    addr: {x}");
         }
     }
-    for (name, pattern) in policy.ruleset_patterns() {
-        println!("ruleset [{name}]: {pattern}");
+    for r in policy.ruleset_patterns() {
+        println!("ruleset [{}:{}]: {}", r.rule_type, r.name, r.pattern);
     }
     Ok(0)
 }

@@ -150,14 +150,14 @@ fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -
     let rules: Vec<Value> = policy
         .ruleset_patterns()
         .iter()
-        .map(|(name, pattern)| {
+        .map(|r| {
             json!({
-                "type": "commit_message_pattern",
+                "type": r.rule_type,
                 "parameters": {
-                    "name": name,
+                    "name": r.name,
                     "negate": true,
                     "operator": "regex",
-                    "pattern": pattern,
+                    "pattern": r.pattern,
                 },
             })
         })
