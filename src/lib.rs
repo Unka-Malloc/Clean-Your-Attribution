@@ -168,8 +168,15 @@ pub fn load_policy(policy_url: Option<&str>) -> Result<Policy> {
         .map(str::to_string)
         .or_else(|| std::env::var("CYA_POLICY_URL").ok());
     let (json, source) = if let Some(url) = url {
+        // HTTPS only, redirects pinned to https: a plaintext or downgraded
+        // fetch could inject identities and make `cya clean` strip human
+        // attribution — the preset floor cannot stop additions.
+        ensure!(
+            url.to_lowercase().starts_with("https://"),
+            "policy URL must be https: {url}"
+        );
         let out = Command::new("curl")
-            .args(["-fsSL", &url])
+            .args(["-fsSL", "--proto-redir", "=https", &url])
             .output()
             .context("failed to launch curl")?;
         ensure!(out.status.success(), "policy fetch failed: {url}");
@@ -199,13 +206,13 @@ fn name_matches(candidate: &str, agent: &Agent) -> bool {
                 && c[n.len()..]
                     .chars()
                     .next()
-                    .map_or(false, |ch| !ch.is_alphanumeric()))
+                    .is_some_and(|ch| !ch.is_alphanumeric()))
     })
 }
 
 fn addr_matches(addr: &str, agent: &Agent) -> bool {
     let a = addr.trim().to_lowercase();
-    if agent.addresses.iter().any(|x| a == *x) {
+    if agent.addresses.contains(&a) {
         return true;
     }
     // A users.noreply.github.com address matches on its local part alone,
@@ -303,7 +310,7 @@ fn exact_name_agent(value: &str, policy: &Policy) -> Option<String> {
     policy
         .agents
         .iter()
-        .find(|a| a.names.iter().any(|n| v == *n))
+        .find(|a| a.names.contains(&v))
         .map(|a| a.id.clone())
 }
 
@@ -546,36 +553,47 @@ impl Policy {
             .collect::<Vec<_>>()
             .join("|");
 
+        // Server-side rules are a deliberately SAFE SUBSET of the local
+        // classifier: RE2 cannot express "not the subject line" or the
+        // exact-name fallback, so `Key:` rules only cover keys ending in
+        // `-by` — every real attribution key (Co-authored-by, Signed-off-by,
+        // Reviewed-by, Generated-by, Assisted-by, …) has that shape, while
+        // conventional-commit subjects (feat:, converge:, archive:) can
+        // never match. Exotic non-`-by` trailer keys and loose prose values
+        // remain CLI-detected only — a documented server-side gap, never a
+        // false rejection.
+        let by_key = "[A-Za-z][A-Za-z0-9-]*-by";
+
         let mut rules = vec![
             RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny listed agent names in attribution lines".into(),
+                name: "deny listed names in -by trailer values".into(),
                 pattern: format!(
-                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                    "(?im)^{by_key}:[ \\t]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
                 ),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny listed agent addresses in attribution lines".into(),
+                name: "deny listed addresses in -by trailer brackets".into(),
+                pattern: format!("(?im)^{by_key}:[^<\\n]*<(?:{addr_alt})>"),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny listed names in bare Name <email> lines".into(),
                 pattern: format!(
-                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[^<\\n]*<(?:{addr_alt})>"
+                    "(?im)^(?:{names_alt})(?:[^A-Za-z0-9\\n][^<\\n]*)?<[^>\\n]*@"
                 ),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny bare agent name-address lines".into(),
-                pattern: format!("(?im)^(?:{names_alt})[ \\t]*<[^>\\n]*>"),
-            },
-            RulesetRule {
-                rule_type: "commit_message_pattern",
-                name: "deny bare agent address lines".into(),
+                name: "deny bare listed address lines".into(),
                 pattern: format!("(?im)^<?(?:{addr_alt})>?[ \\t]*$"),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny generated-with badges naming listed agents".into(),
+                name: "deny generated-with badges naming denied identities".into(),
                 pattern: format!(
-                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with[^\\n]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with[^\\n]*(?:(?:{names_alt})(?:$|[^A-Za-z0-9])|(?:{shape_names_alt}))"
                 ),
             },
             RulesetRule {
@@ -592,20 +610,39 @@ impl Policy {
         if !shape_names_alt.is_empty() {
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny agent-shaped names in identity trailers".into(),
+                name: "deny agent-shaped names in -by identity trailers".into(),
                 pattern: format!(
-                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*[^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
+                    "(?im)^{by_key}:[ \\t]*[^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
                 ),
             });
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny agent-shaped bare-login trailer values".into(),
+                name: "deny agent-shaped bare -by trailer tokens".into(),
                 pattern: format!(
-                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*[^ \\t\\n]*(?:{shape_names_alt})[^ \\t\\n]*[ \\t]*$"
+                    "(?im)^{by_key}:[ \\t]*[^ \\t\\n]*(?:{shape_names_alt})[^ \\t\\n]*[ \\t]*$"
+                ),
+            });
+            rules.push(RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny agent-shaped names in bare Name <email> lines".into(),
+                pattern: format!(
+                    "(?im)^[^ \\t\\n<][^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
                 ),
             });
         }
         if !shape_addr_alt.is_empty() {
+            rules.push(RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny agent-shaped addresses in -by trailer brackets".into(),
+                pattern: format!("(?im)^{by_key}:[^<\\n]*<[^@>\\n]*(?:{shape_addr_alt})[^@>\\n]*@"),
+            });
+            rules.push(RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny bare agent-shaped address lines".into(),
+                pattern: format!(
+                    "(?im)^<?[^>@\\s]*(?:{shape_addr_alt})[^>@\\s]*@[^>\\s]*>?[ \\t]*$"
+                ),
+            });
             rules.push(RulesetRule {
                 rule_type: "commit_author_email_pattern",
                 name: "deny agent-shaped author addresses".into(),
@@ -752,7 +789,7 @@ mod tests {
             "dependabot[bot] fixed it upstream",
             "we use agents for reviews",
             "`AdapterContract::new(\"<agent>\")`. The parser alias stays asserted",
-            "crates/licoup-agent-<agent>/src/parser.rs` and `adapters/mod.rs` names the",
+            "crates/example-agent-<agent>/src/parser.rs` and `adapters/mod.rs` names the",
         ] {
             let (_, removed) = strip_denied(&format!("fix: t\n\n{line}\n"), &policy());
             assert!(removed.is_empty(), "line: {line}");
@@ -860,6 +897,49 @@ mod tests {
                 r.name,
                 r.pattern
             );
+        }
+    }
+
+    /// Server-side message rules are a safe subset of the classifier: every
+    /// message they deny is denied locally, and the classifier's preserved
+    /// cases (prose, subjects, placeholders, humans) are never rejected.
+    /// Exotic non-`-by` trailer keys stay a documented server-side gap.
+    #[test]
+    fn ruleset_patterns_match_classifier_verdicts() {
+        let p = policy();
+        let msg_rules: Vec<Regex> = p
+            .ruleset_patterns()
+            .iter()
+            .filter(|r| r.rule_type == "commit_message_pattern")
+            .map(|r| Regex::new(&r.pattern).unwrap())
+            .collect();
+        let server_denies = |msg: &str| msg_rules.iter().any(|r| r.is_match(msg));
+
+        for msg in [
+            CODEX_MSG,
+            "fix: t\n\nSigned-off-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>\n",
+            "fix: t\n\nReviewed-by: Cursor Agent <cursoragent@cursor.com>\n",
+            "fix: t\n\nfactory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>\n",
+            "feat: y\n\n🤖 Generated with [Claude Code](https://claude.ai/code)\n",
+            "fix: t\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n",
+        ] {
+            let (_, removed) = strip_denied(msg, &p);
+            assert!(!removed.is_empty(), "classifier should deny: {msg}");
+            assert!(server_denies(msg), "server should deny: {msg}");
+        }
+        for msg in [
+            "fix: t\n\narchive: OpenAI Codex under the user-local bin directory, placed home\n",
+            "converge: agent/retire-ecosystem-owner-matrix\n",
+            "feat: add Claude Code integration\n",
+            "fix: t\n\n`AdapterContract::new(\"<agent>\")` stays\n",
+            "fix: t\n\nCo-authored-by: Jane Doe <jane@corp.com>\n",
+            "fix: t\n\nCo-authored-by: Lulot <lulot@users.noreply.github.com>\n",
+            "fix: t\n\nnotes: talked to the agent yesterday\n",
+            "fix: t\n\nwe use dependabot[bot] for updates\n",
+        ] {
+            let (_, removed) = strip_denied(msg, &p);
+            assert!(removed.is_empty(), "classifier should keep: {msg}");
+            assert!(!server_denies(msg), "server must not deny: {msg}");
         }
     }
 

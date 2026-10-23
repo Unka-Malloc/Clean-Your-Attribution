@@ -23,9 +23,10 @@ jobs:
     name: attribution scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve scan range
         id: range
@@ -38,7 +39,13 @@ jobs:
               echo "range=${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
               ;;
             push)
-              echo "range=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              # A zero `before` means a new ref: everything reachable from
+              # the pushed head is new, so scan it.
+              if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+                echo "range=HEAD" >> "$GITHUB_OUTPUT"
+              else
+                echo "range=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              fi
               ;;
             *)
               echo "range=HEAD" >> "$GITHUB_OUTPUT"
@@ -72,6 +79,8 @@ jobs:
 
       - name: Scan pull request title and body
         if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          printf '%s\n%s\n' "${{ github.event.pull_request.title }}" "${{ github.event.pull_request.body }}" \
-            | "$RUNNER_TEMP/cya" scan --stdin
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | "$RUNNER_TEMP/cya" scan --stdin

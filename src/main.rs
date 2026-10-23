@@ -24,7 +24,7 @@ fn git(args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("failed to run git {}", args[0]))?;
     anyhow::ensure!(out.status.success(), "git {} failed", args.join(" "));
-    Ok(String::from_utf8(out.stdout).context("git output not utf-8")?)
+    String::from_utf8(out.stdout).context("git output not utf-8")
 }
 
 fn try_git(args: &[&str]) -> Option<String> {
@@ -360,6 +360,23 @@ fn cmd_hook(argv: &[String]) -> Result<i32> {
         .context("not inside a git work tree")?;
     if dir.ends_with(".githooks") {
         eprintln!("cya: global core.hooksPath detected — installing repo-local .githooks/ for dispatcher chaining");
+        // .githooks/ sits inside the worktree — keep it out of commits so
+        // machine-local hook paths never leak into history.
+        if let Some(git_dir) = try_git(&["rev-parse", "--git-dir"]) {
+            let exclude = PathBuf::from(git_dir).join("info/exclude");
+            let current = fs::read_to_string(&exclude).unwrap_or_default();
+            if !current.lines().any(|l| l.trim() == ".githooks/") {
+                if let Some(parent) = exclude.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut line = String::from(".githooks/\n");
+                if !current.is_empty() && !current.ends_with('\n') {
+                    line = format!("\n{line}");
+                }
+                fs::write(&exclude, format!("{current}{line}"))?;
+                eprintln!("cya: added .githooks/ to .git/info/exclude");
+            }
+        }
     }
     fs::create_dir_all(&dir)?;
     let exe = current_exe()?;

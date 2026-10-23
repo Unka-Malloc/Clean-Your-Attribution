@@ -2,7 +2,7 @@
 //! workflow, two repo rulesets, and squash-only merge settings on every
 //! targeted repository.
 //!
-//!   ag-apply --orgs LicoLand,Meshrix-Platform,SymPolicy --users Unka-Malloc \
+//!   ag-apply --orgs ORG1,ORG2 --users OWNER \
 //!     [--enforcement evaluate|active|disabled] [--include-private] \
 //!     [--repos o/r,...] [--dry-run]
 //!
@@ -79,12 +79,24 @@ fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
 
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
+    // The credential never enters argv: curl -H @file reads the header from
+    // a mode-0600 temp file, removed immediately after the call. Process
+    // lists and command logging see only the path.
+    let auth_dir = env::temp_dir().join(format!("ag-auth-{}", std::process::id()));
+    fs::create_dir_all(&auth_dir)?;
+    let auth_file = auth_dir.join("header");
+    fs::write(&auth_file, format!("Authorization: Bearer {token}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600))?;
+    }
     let mut argv = vec![
         "-sS".into(),
         "-X".into(),
         method.into(),
         "-H".into(),
-        format!("Authorization: Bearer {token}"),
+        format!("@{}", auth_file.display()),
         "-H".into(),
         "Accept: application/vnd.github+json".into(),
     ];
@@ -106,6 +118,7 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         .output()
         .context("curl failed")?;
     drop(tmp);
+    let _ = fs::remove_dir_all(&auth_dir);
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
     if text.trim().is_empty() {
@@ -222,27 +235,32 @@ const MERGE_SETTINGS: &str = r#"{
 
 // ---------------------------------------------------------------- apply --
 
+fn list_paginated(path: &str) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    for page in 1..=100 {
+        let items = api("GET", &format!("{path}&page={page}"), None)?;
+        let rows = items.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+        all.extend_from_slice(rows);
+        if rows.len() < 100 {
+            return Ok(all);
+        }
+    }
+    anyhow::bail!(
+        "pagination exceeded 100 pages for {path} — refusing to claim complete enumeration"
+    )
+}
+
 fn list_repos(args: &Args) -> Result<Vec<String>> {
     let mut named: Vec<String> = args.repos.clone();
     for org in &args.orgs {
-        let page = api(
-            "GET",
-            &format!("/orgs/{org}/repos?per_page=100&type=all"),
-            None,
-        )?;
-        for r in page.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        for r in list_paginated(&format!("/orgs/{org}/repos?per_page=100&type=all"))? {
             if let Some(name) = r.get("full_name").and_then(Value::as_str) {
                 named.push(name.into());
             }
         }
     }
     for user in &args.users {
-        let page = api(
-            "GET",
-            &format!("/users/{user}/repos?per_page=100&type=owner"),
-            None,
-        )?;
-        for r in page.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        for r in list_paginated(&format!("/users/{user}/repos?per_page=100&type=owner"))? {
             if let Some(name) = r.get("full_name").and_then(Value::as_str) {
                 named.push(name.into());
             }
