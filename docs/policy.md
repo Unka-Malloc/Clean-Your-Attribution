@@ -65,18 +65,34 @@ literally named "Agent Smith" or an account like `agent.smith@corp.com`
 in an attribution position is collateral the operator accepts in exchange
 for catching every future unlisted agent.
 
-Server side, the same coverage maps to ruleset rule types: five
-`commit_message_pattern` rules plus `commit_author_email_pattern` and
-`committer_email_pattern` denying the verified addresses in the identity
-fields themselves.
+Server side, the ruleset enforces a **safe subset** of the local
+classifier: `commit_author_email_pattern` and `committer_email_pattern`
+deny the verified addresses and agent-shaped locals in the identity
+fields, and the `commit_message_pattern` rules below deny the same
+identities in message lines — but deliberately narrower, so no valid
+commit is ever rejected server-side that the CLI would keep.
 
 ## Ruleset generation
 
 `Policy::ruleset_patterns()` derives the GitHub `commit_message_pattern`
-RE2 rules from the catalogue at build time — one name rule, one address
-rule (noreply logins with optional `<id>+` prefix plus exact vendor
-addresses), one generated-with badge rule. The JSON carries no regex, so
-the server-side policy cannot drift from the binaries.
+RE2 rules from the catalogue at build time — the JSON carries no regex,
+so the server-side policy cannot drift from the binaries. The generated
+message rules encode the classifier's signature-position constraints:
+
+- **`Key:` lines** — only `*-by` keys (the attribution-key shape) are
+  denied, and only when the value is identity-shaped (`Name <email>`,
+  `<id>+login[bot]@users.noreply…`, or the exact catalogue name). Prose
+  keys like `archive:` or conventional-commit subjects (`feat:`, `fix:`)
+  never fire; exotic non-`-by` attribution keys stay a documented
+  server-side gap the CLI still catches.
+- **Bare identity lines** — `Name <email>` with a denied name or shape,
+  or a bare denied address/login token.
+- **Generated-with badges** — denied names anchor at the badge-label
+  start, agent shapes match inside the label only (`[SomeTool](…/agent)`
+  URLs cannot fire the shape rule).
+
+The address-field rules need no position argument — author/committer is
+always an identity position.
 
 ## Resolution order
 

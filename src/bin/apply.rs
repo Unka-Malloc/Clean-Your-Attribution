@@ -77,20 +77,54 @@ fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     }
 }
 
+/// RAII guard: removes the temp dir on every return path.
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn private(tag: &str) -> Result<Self> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ag-{tag}-{}-{unique}", std::process::id()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&dir)?;
+        Ok(Self(dir))
+    }
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
     // The credential never enters argv: curl -H @file reads the header from
-    // a mode-0600 temp file, removed immediately after the call. Process
-    // lists and command logging see only the path.
-    let auth_dir = env::temp_dir().join(format!("ag-auth-{}", std::process::id()));
-    fs::create_dir_all(&auth_dir)?;
-    let auth_file = auth_dir.join("header");
-    fs::write(&auth_file, format!("Authorization: Bearer {token}\n"))?;
+    // a file inside a unique 0700 temp dir, created O_EXCL with mode 0600 —
+    // the token is never world-readable, never follows a pre-existing path,
+    // and the guard removes it on every return path.
+    let auth_dir = TempDir::private("auth")?;
+    let auth_file = auth_dir.path("header");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&auth_file)?
+            .write_all(format!("Authorization: Bearer {token}\n").as_bytes())?;
     }
+    #[cfg(not(unix))]
+    fs::write(&auth_file, format!("Authorization: Bearer {token}\n"))?;
     let mut argv = vec![
         "-sS".into(),
         "-X".into(),
@@ -100,15 +134,14 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         "-H".into(),
         "Accept: application/vnd.github+json".into(),
     ];
-    let mut tmp = None;
+    let mut body_dir = None;
     if let Some(body) = body {
-        let dir = env::temp_dir().join(format!("ag-body-{}", std::process::id()));
-        fs::create_dir_all(&dir)?;
-        let file = dir.join("body.json");
+        let dir = TempDir::private("body")?;
+        let file = dir.path("body.json");
         fs::write(&file, body.to_string())?;
         argv.push("--data".into());
         argv.push(format!("@{}", file.display()));
-        tmp = Some(file);
+        body_dir = Some(dir);
     }
     argv.push("-H".into());
     argv.push("X-GitHub-Api-Version: 2022-11-28".into());
@@ -117,8 +150,7 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         .args(&argv)
         .output()
         .context("curl failed")?;
-    drop(tmp);
-    let _ = fs::remove_dir_all(&auth_dir);
+    drop(body_dir);
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
     if text.trim().is_empty() {
@@ -140,17 +172,16 @@ fn api_gitvault(method: &str, path: &str, body: Option<&Value>) -> Result<Value>
     if method != "GET" {
         argv.extend(["-X".into(), method.into()]);
     }
-    let mut tmp = None;
+    let mut body_dir = None;
     if let Some(body) = body {
-        let dir = env::temp_dir().join(format!("ag-body-{}", std::process::id()));
-        fs::create_dir_all(&dir)?;
-        let file = dir.join("body.json");
+        let dir = TempDir::private("body")?;
+        let file = dir.path("body.json");
         fs::write(&file, body.to_string())?;
         argv.extend(["--input".into(), file.display().to_string()]);
-        tmp = Some(file);
+        body_dir = Some(dir);
     }
     let out = Command::new("gitvault").args(&argv).output();
-    drop(tmp);
+    drop(body_dir);
     let out = out.context("gitvault failed to run")?;
     anyhow::ensure!(
         out.status.success(),

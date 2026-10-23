@@ -590,10 +590,14 @@ impl Policy {
                 pattern: format!("(?im)^<?(?:{addr_alt})>?[ \\t]*$"),
             },
             RulesetRule {
+                // Catalogue names anchor at the badge-label start (local
+                // prefix semantics); shape substrings may appear anywhere
+                // inside the label but never past `]`/`(` — so a link URL
+                // like (…/agent) cannot fire the shape rule.
                 rule_type: "commit_message_pattern",
                 name: "deny generated-with badges naming denied identities".into(),
                 pattern: format!(
-                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with[^\\n]*(?:(?:{names_alt})(?:$|[^A-Za-z0-9])|(?:{shape_names_alt}))"
+                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with\\s*\\[?\\s*(?:(?:{names_alt})(?:$|[^A-Za-z0-9])|[^\\]\\(\\n]*(?:{shape_names_alt}))"
                 ),
             },
             RulesetRule {
@@ -936,6 +940,7 @@ mod tests {
             "fix: t\n\nCo-authored-by: Lulot <lulot@users.noreply.github.com>\n",
             "fix: t\n\nnotes: talked to the agent yesterday\n",
             "fix: t\n\nwe use dependabot[bot] for updates\n",
+            "feat: x\n\n🤖 Generated with [SomeTool](https://example.com/agent)\n",
         ] {
             let (_, removed) = strip_denied(msg, &p);
             assert!(removed.is_empty(), "classifier should keep: {msg}");
