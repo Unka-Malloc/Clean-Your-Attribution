@@ -11,7 +11,7 @@ runner job (`ubuntu-latest`) per attribution-relevant event.
 | Quantity | Value | Source |
 |---|---|---|
 | Billing basis | Public repositories use **zero billed minutes** on GitHub-hosted runners; private repositories would consume the plan's included minutes first | GitHub Docs — *About billing for GitHub Actions*: <https://docs.github.com/en/billing/concepts/product-billing/github-actions> ("GitHub Actions usage is free for standard GitHub-hosted runners in public repositories") |
-| Trigger volume | One job per `pull_request` or `merge_group` event, and per `push` event on the repository's default branch (other-branch pushes are skipped in seconds — their commits are scanned at PR time); bounded by human commit activity; no schedules, no matrix, single job | this workflow |
+| Trigger volume | One job per `pull_request` or `merge_group` event, and per `push` event on the default branch or a tag (other-branch pushes are skipped in seconds — their commits are scanned at PR time; tags are never skipped since they can point at commits no PR covered); bounded by human commit activity; no schedules, no matrix, single job | this workflow |
 | `workflow_call` volume | Caller-defined — the workflow is also reusable; each calling repo's triggers determine its frequency (same per-run cost) | this workflow `on:` block |
 | Per-run wall time | ~10 s (release asset present) or ~60–90 s (cold `cargo install --git` fallback — unmeasured estimate, until a `cya` release exists) | `cargo build --release` ≈ 40 s clean locally |
 | Network per run, release path | One repo fetch (`fetch-depth: 0`, ≈ 1 MB git data at current size) + one release-asset download (≈ 5 MB) + optional policy fetch only if `CYA_POLICY_URL` is set (single HTTPS GET) | this workflow |

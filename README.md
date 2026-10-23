@@ -15,7 +15,7 @@ tested; the rollout tool builds, but the fleet has not been applied yet.
 | Surface | What it does | Where it runs |
 | --- | --- | --- |
 | `cya` binary | scans or rewrites commit messages, stripping denied trailers; installs repo hooks | any machine — yours or a collaborator's, a single static binary |
-| `sig-check.yml` workflow | scans the PR/merge-group commit range, default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
+| `sig-check.yml` workflow | scans the PR/merge-group commit range, tag and default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
 | `ag-apply` binary | installs the workflow, two rulesets, and squash-only merge settings in every targeted repo | run by an operator locally |
 
 All three resolve from the same source of truth: `policy/trailers.json`,
