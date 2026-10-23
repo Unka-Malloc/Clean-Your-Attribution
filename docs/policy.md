@@ -77,9 +77,10 @@ commit is ever rejected server-side that the CLI would keep.
 `Policy::ruleset_patterns()` derives the GitHub `commit_message_pattern`
 RE2 rules from the catalogue at build time — the JSON carries no regex,
 so the server-side policy cannot drift from the binaries. The generated
-message rules encode the classifier's signature-position constraints —
-every pattern anchors on `\n`, so the subject line is never scanned at
-all, and no rule fires on an indented line:
+message rules encode the classifier's signature-position constraints;
+no rule fires on an indented line, and `*-by` rules require a
+non-empty line before the key, so a first-non-empty subject can never
+match a noncanonical key:
 
 - **`Key:` lines** — only `*-by` keys (the attribution-key shape) are
   denied. The canonical `trailerKeys` keep the local prefix semantics
