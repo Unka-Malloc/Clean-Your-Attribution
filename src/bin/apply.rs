@@ -146,21 +146,28 @@ fn api_gitvault(method: &str, path: &str, body: Option<&Value>) -> Result<Value>
 
 // ------------------------------------------------------------- payloads --
 
-fn ruleset_deny_trailers(enforcement: &str, ruleset_pattern: &str) -> Value {
+fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -> Value {
+    let rules: Vec<Value> = policy
+        .ruleset_patterns()
+        .iter()
+        .map(|(name, pattern)| {
+            json!({
+                "type": "commit_message_pattern",
+                "parameters": {
+                    "name": name,
+                    "negate": true,
+                    "operator": "regex",
+                    "pattern": pattern,
+                },
+            })
+        })
+        .collect();
     json!({
         "name": "attribution-gate",
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
-        "rules": [{
-            "type": "commit_message_pattern",
-            "parameters": {
-                "name": "deny attribution trailers",
-                "negate": true,
-                "operator": "regex",
-                "pattern": ruleset_pattern,
-            },
-        }],
+        "rules": rules,
         "bypass_actors": [],
     })
 }
@@ -317,7 +324,7 @@ fn main() -> Result<()> {
         println!("  {full}:");
         let run = || -> Result<()> {
             ensure_workflow(owner, repo, workflow_content, args.dry_run)?;
-            ensure_ruleset(owner, repo, &ruleset_deny_trailers(&args.enforcement, &policy.ruleset_pattern), args.dry_run)?;
+            ensure_ruleset(owner, repo, &ruleset_deny_trailers(&args.enforcement, &policy), args.dry_run)?;
             ensure_ruleset(owner, repo, &ruleset_default_branch(&args.enforcement), args.dry_run)?;
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");

@@ -1,9 +1,11 @@
 # attribution-gate
 
-One attribution policy, three enforcement surfaces. It exists because agent
-tooling keeps inventing new ways to sign commits — `Co-authored-by` trailers,
-generated-with footers, bot identities — and chasing each name is a losing
-game. This project denies the *shape* instead of listing names.
+One attribution policy, three enforcement surfaces. `policy/trailers.json`
+is a precise-match catalogue of *verified* official agent identities
+(display names + attribution addresses, each with a verification pointer):
+a commit line is denied only when it claims one of those identities.
+Human co-authors — including names that merely resemble an agent or
+squatted accounts — are preserved.
 
 State: **initial development**. CLI and check workflow are implemented and
 tested; the rollout tool builds, but the fleet has not been applied yet.

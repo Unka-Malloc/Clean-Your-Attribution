@@ -37,7 +37,7 @@ fn current_exe() -> Result<PathBuf> {
 
 fn report(label: &str, findings: &Findings) -> usize {
     for t in &findings.trailers {
-        eprintln!("  {label} L{}: {}", t.line, t.text);
+        eprintln!("  {label} L{}: {}  [{}]", t.line, t.text, t.agent);
     }
     for p in &findings.patterns {
         eprintln!("  {label} L{}: {}  [{}]", p.line, p.text, p.id);
@@ -261,22 +261,42 @@ fn cmd_hook(argv: &[String]) -> Result<i32> {
 
 fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
     if has_flag(argv, "--check") {
-        let pattern_lc = policy.ruleset_pattern.to_lowercase();
-        for key in &policy.deny_trailer_keys {
+        anyhow::ensure!(!policy.agents.is_empty(), "policy lists no agents");
+        for a in &policy.agents {
             anyhow::ensure!(
-                pattern_lc.contains(key),
-                "rulesetPattern missing deny key {key}"
+                !a.names.is_empty() || !a.addresses.is_empty(),
+                "agent {:?} has neither names nor addresses",
+                a.id
+            );
+            anyhow::ensure!(!a.verify.is_empty(), "agent {:?} lacks a verify reference", a.id);
+        }
+        for (name, pattern) in policy.ruleset_patterns() {
+            anyhow::ensure!(
+                regex::Regex::new(&pattern).is_ok(),
+                "ruleset pattern {name:?} does not compile"
             );
         }
-        println!("policy ok (source: {})", policy.source);
+        println!(
+            "policy ok ({} verified agents, source: {})",
+            policy.agents.len(),
+            policy.source
+        );
         return Ok(0);
     }
     println!("source: {}", policy.source);
-    println!("denyTrailerKeys: {}", policy.deny_trailer_keys.join(", "));
-    for p in &policy.deny_patterns {
-        println!("denyPattern [{}]: {}", p.id, p.regex.as_str());
+    println!("trailerKeys: {}", policy.trailer_keys.join(", "));
+    for a in &policy.agents {
+        println!("agent [{}] ({})", a.id, a.verify);
+        for n in &a.names {
+            println!("    name: {n}");
+        }
+        for x in &a.addresses {
+            println!("    addr: {x}");
+        }
     }
-    println!("rulesetPattern: {}", policy.ruleset_pattern);
+    for (name, pattern) in policy.ruleset_patterns() {
+        println!("ruleset [{name}]: {pattern}");
+    }
     Ok(0)
 }
 

@@ -1,18 +1,205 @@
 {
-  "version": 1,
-  "denyTrailerKeys": [
-    "Co-authored-by",
-    "Generated-by",
-    "Assisted-by"
-  ],
-  "denyMessagePatterns": [
+  "version": 2,
+  "updated": "2026-10-23",
+  "matchNote": "Precise-match catalogue: an attribution trailer or generated-with badge is denied only when it claims one of the verified official agent identities below (by display name or by address). Human co-authors — including names that merely resemble an agent or squatted accounts — are preserved. Entries must carry a verify reference; unverified identities are listed separately and are NOT denied.",
+  "trailerKeys": ["Co-authored-by", "Generated-by", "Assisted-by"],
+  "agents": [
     {
-      "id": "generated-with-footer",
-      "flags": "im",
-      "pattern": "^\\s*.{0,8}generated with\\b.*$",
-      "note": "Footer lines like \"🤖 Generated with <tool>\" that carry no trailer key."
+      "id": "openai-codex",
+      "display": "OpenAI Codex",
+      "verify": "github.com/codex (User 267193182) + github.com/apps/chatgpt-codex-connector (Bot 199175422)",
+      "names": ["Codex", "OpenAI Codex", "ChatGPT", "chatgpt-codex-connector[bot]", "codex[bot]"],
+      "addresses": [
+        "codex@users.noreply.github.com",
+        "267193182+codex@users.noreply.github.com",
+        "chatgpt-codex-connector[bot]@users.noreply.github.com",
+        "199175422+chatgpt-codex-connector[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "claude",
+      "display": "Anthropic Claude",
+      "verify": "github.com/claude (User 81847, Anthropic) + github.com/apps/claude (Bot 209825114); Claude Code trailers use noreply@anthropic.com",
+      "names": ["Claude Code", "claude[bot]"],
+      "addresses": [
+        "noreply@anthropic.com",
+        "claude[bot]@users.noreply.github.com",
+        "209825114+claude[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "cursor",
+      "display": "Cursor Agent",
+      "verify": "github.com/cursoragent (User 199161495) + github.com/cursor[bot] (Bot 206951365)",
+      "names": ["Cursor Agent", "CursorAgent", "cursor[bot]"],
+      "addresses": [
+        "cursoragent@cursor.com",
+        "cursoragent@users.noreply.github.com",
+        "199161495+cursoragent@users.noreply.github.com",
+        "cursor[bot]@users.noreply.github.com",
+        "206951365+cursor[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "devin",
+      "display": "Cognition Devin",
+      "verify": "github.com/apps/devin-ai-integration (Bot 158243242)",
+      "names": ["Devin AI", "devin-ai-integration[bot]"],
+      "addresses": [
+        "devin-ai-integration[bot]@users.noreply.github.com",
+        "158243242+devin-ai-integration[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "commandcode",
+      "display": "Command Code",
+      "verify": "github.com/CommandCodeBot (User 265127642) + github.com/commandcode (Org 115894382)",
+      "names": ["CommandCode", "Command Code", "CommandCodeBot"],
+      "addresses": [
+        "commandcodebot@users.noreply.github.com",
+        "265127642+commandcodebot@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "github-copilot",
+      "display": "GitHub Copilot",
+      "verify": "copilot-swe-agent[bot] resolves to Copilot (Bot 198982749); Autofix identity 175728472",
+      "names": ["Copilot", "GitHub Copilot", "Copilot Autofix", "copilot[bot]", "copilot-swe-agent[bot]"],
+      "addresses": [
+        "copilot@users.noreply.github.com",
+        "198982749+copilot@users.noreply.github.com",
+        "175728472+copilot@users.noreply.github.com",
+        "copilot-swe-agent[bot]@users.noreply.github.com",
+        "copilot@github.com"
+      ]
+    },
+    {
+      "id": "google-jules",
+      "display": "Google Jules",
+      "verify": "github.com/apps/google-labs-jules (Bot 161369871); bare github.com/jules (User 30194392) is a squatted HUMAN — match only via official addresses",
+      "names": ["google-labs-jules[bot]"],
+      "addresses": [
+        "jules@google.com",
+        "google-labs-jules[bot]@users.noreply.github.com",
+        "161369871+google-labs-jules[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "google-gemini",
+      "display": "Google Gemini",
+      "verify": "github.com/gemini-cli (User 218195315) + github.com/apps/gemini-code-assist (Bot 176961590)",
+      "names": ["Gemini CLI", "Gemini Code Assist", "gemini-cli", "gemini-code-assist[bot]"],
+      "addresses": [
+        "gemini-cli@users.noreply.github.com",
+        "218195315+gemini-cli@users.noreply.github.com",
+        "gemini-code-assist[bot]@users.noreply.github.com",
+        "176961590+gemini-code-assist[bot]@users.noreply.github.com",
+        "gemini@google.com",
+        "gemini-code-assist@google.com"
+      ]
+    },
+    {
+      "id": "amazon-q",
+      "display": "Amazon Q Developer",
+      "verify": "github.com/apps/amazon-q-developer (Bot 208079219)",
+      "names": ["Amazon Q", "Amazon Q Developer", "amazon-q-developer[bot]"],
+      "addresses": [
+        "q-developer@amazon.com",
+        "amazonq@amazon.com",
+        "amazon-q@amazon.com",
+        "amazon-q-developer[bot]@users.noreply.github.com",
+        "208079219+amazon-q-developer[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "cline",
+      "display": "Cline",
+      "verify": "github.com/apps/cline (Bot 205137888)",
+      "names": ["cline[bot]", "Cline Bot"],
+      "addresses": [
+        "cline[bot]@users.noreply.github.com",
+        "205137888+cline[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "sweep",
+      "display": "Sweep",
+      "verify": "github.com/apps/sweep-nightly (Bot 131841235)",
+      "names": ["Sweep", "Sweep AI", "sweep-nightly[bot]"],
+      "addresses": [
+        "sweep-nightly[bot]@users.noreply.github.com",
+        "131841235+sweep-nightly[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "coderabbit",
+      "display": "CodeRabbit",
+      "verify": "github.com/apps/coderabbitai (Bot 136622811); review bot that can also author fix commits",
+      "names": ["CodeRabbit", "coderabbitai[bot]"],
+      "addresses": [
+        "coderabbitai[bot]@users.noreply.github.com",
+        "136622811+coderabbitai[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "factory-droid",
+      "display": "Factory Droid",
+      "verify": "github.com/apps/factory-droid (Bot 138933559, authors commits in Factory-AI/factory); bare github.com/factory-droid (User 234992389) is a squatted account",
+      "names": ["Factory Droid", "factory-droid[bot]", "factory[bot]", "factory-ai[bot]"],
+      "addresses": [
+        "factory-droid[bot]@users.noreply.github.com",
+        "138933559+factory-droid[bot]@users.noreply.github.com",
+        "factory[bot]@users.noreply.github.com",
+        "30254625+factory[bot]@users.noreply.github.com",
+        "factory-ai[bot]@users.noreply.github.com",
+        "238589158+factory-ai[bot]@users.noreply.github.com"
+      ]
+    },
+    {
+      "id": "openhands",
+      "display": "OpenHands",
+      "verify": "github.com/OpenHands (Org 225919603)",
+      "names": ["OpenHands", "openhands", "OpenHands Agent"],
+      "addresses": [
+        "openhands@users.noreply.github.com",
+        "openhands@all-hands.dev"
+      ]
+    },
+    {
+      "id": "aider",
+      "display": "Aider",
+      "verify": "aider.chat attribution convention; bare github.com/aider (User 595565) is a squatted account",
+      "names": ["Aider (aider.chat)"],
+      "addresses": ["noreply@aider.chat", "aider@aider.chat"]
+    },
+    {
+      "id": "warp",
+      "display": "Warp Agent",
+      "verify": "agent@warp.dev documented as the Warp agent attribution address",
+      "names": ["Warp Agent"],
+      "addresses": ["agent@warp.dev"]
+    },
+    {
+      "id": "trae",
+      "display": "Trae (ByteDance)",
+      "verify": "github.com/Trae-AI (Org 192691831)",
+      "names": ["Trae Agent", "Trae AI", "Trae-AI"],
+      "addresses": []
+    },
+    {
+      "id": "codegen",
+      "display": "Codegen",
+      "verify": "github.com/codegen-sh (Org 130597291)",
+      "names": ["Codegen", "codegen-sh", "codegen-sh[bot]"],
+      "addresses": ["codegen-sh@users.noreply.github.com"]
     }
   ],
-  "rulesetPattern": "(?m)^(Co-authored-by|Generated-by|Assisted-by):",
-  "rulesetNote": "RE2 regex used verbatim in GitHub ruleset metadata restrictions; keep in sync with denyTrailerKeys."
+  "unverified": [
+    { "display": "Moonshot Kimi", "note": "github.com/kimi (User 154502) is a squatted human account; no verified official identity yet — not denied" },
+    { "display": "Alibaba Lingma / Qwen", "note": "lingma@alibaba.com, qwen*@alibabacloud.com appear in GitVault rules but are not account-verified — not denied" },
+    { "display": "DeepSeek / Xiaomi MiMo / MiniMax / GLM", "note": "vendor attribution addresses unverified — not denied" },
+    { "display": "Kilo Code / Roo Code / Kiro / Junie / Augment / Windsurf / Codeium / Tabnine / Qodo / Zed / Goose / Continue / Crush / Amp", "note": "no verified official GitHub identity yet — not denied" },
+    { "display": "LuloT", "note": "github.com/LuloT (User 61850969) is a real human — never add to agents" },
+    { "display": "bare logins jules / aider / kimi / factory-droid", "note": "squatted human accounts; matching uses official addresses and [bot] logins only" }
+  ]
 }
