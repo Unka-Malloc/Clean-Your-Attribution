@@ -441,9 +441,11 @@ fn main() -> Result<()> {
         }
         println!("  {full}:");
         let run = || -> Result<()> {
-            // Tag protection lands before the workflow update: if the ruleset
-            // call fails, the still-deployed older workflow keeps scanning
-            // tag pushes instead of leaving them both unprotected.
+            // Tag protection lands before the workflow update. On an upgrade
+            // path this preserves any older workflow that still scanned tag
+            // pushes; on a first install a failure here simply means nothing
+            // is deployed yet — either way the run must report the repo as
+            // not fully protected rather than claim a partial success.
             ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
             ensure_workflow(owner, repo, workflow_content, args.dry_run)?;
             ensure_ruleset(
@@ -473,6 +475,10 @@ fn main() -> Result<()> {
         if let Err(e) = run() {
             failures.push(full.clone());
             println!("    FAILED: {e:#}");
+            println!(
+                "    repo NOT fully protected — an interrupted rollout can leave it \
+                 partly enrolled; rerun ag-apply before treating it as covered"
+            );
         }
     }
     if failures.is_empty() {
@@ -486,4 +492,27 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ruleset_tags;
+
+    #[test]
+    fn tag_ruleset_is_fail_closed() {
+        for (input, expected) in [
+            ("evaluate", "active"),
+            ("active", "active"),
+            ("disabled", "disabled"),
+        ] {
+            let rs = ruleset_tags(input);
+            assert_eq!(rs["enforcement"], expected, "enforcement {input}");
+            assert_eq!(rs["target"], "tag");
+        }
+        let rs = ruleset_tags("evaluate");
+        assert_eq!(rs["rules"].as_array().unwrap().len(), 3);
+        let bypass = rs["bypass_actors"].as_array().unwrap();
+        assert_eq!(bypass.len(), 1);
+        assert_eq!(bypass[0]["actor_type"], "RepositoryRole");
+    }
 }

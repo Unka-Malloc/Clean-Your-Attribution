@@ -111,12 +111,15 @@ creation, update and deletion to repository administrators. Pointing a
 tag at an unscanned commit then requires the same actor who could push
 to the default branch directly.
 
-The tag ruleset is fail-closed by construction: it is installed before
-the workflow update so a failed rollout never leaves tags both
-unrestricted and unscanned, and it always deploys `active` — the
-`--enforcement evaluate` staging mode softens the branch rulesets but
-must not silently reopen tag writes (only an explicit `disabled` turns
-it off).
+The tag ruleset is fail-closed by construction: it always deploys
+`active` — the `--enforcement evaluate` staging mode softens the branch
+rulesets but must not silently reopen tag writes (only an explicit
+`disabled` turns it off). It is also installed before the workflow
+update, so an upgrade rollout that fails there preserves whichever older
+protection was in place; on a first install a failure means nothing was
+deployed, and `ag-apply` reports the repo as not fully protected either
+way — a partially enrolled target must be re-applied, never treated as
+covered.
 
 ## Resolution order
 
