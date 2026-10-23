@@ -558,40 +558,65 @@ impl Policy {
             .join("|");
 
         // Server-side rules are a deliberately SAFE SUBSET of the local
-        // classifier: RE2 cannot express "not the subject line" or the
-        // exact-name fallback, so `Key:` rules only cover keys ending in
-        // `-by` — every real attribution key (Co-authored-by, Signed-off-by,
-        // Reviewed-by, Generated-by, Assisted-by, …) has that shape, while
-        // conventional-commit subjects (feat:, converge:, archive:) can
-        // never match. Exotic non-`-by` trailer keys and loose prose values
-        // remain CLI-detected only — a documented server-side gap, never a
-        // false rejection.
+        // classifier. Two structural constraints shape them:
+        //   - every pattern anchors on `\n`, so the subject line (the first
+        //     line — never preceded by a newline) is never scanned, which
+        //     matches the local is_subject gate;
+        //   - `Key:` rules only cover keys ending in `-by` — every real
+        //     attribution key (Co-authored-by, Signed-off-by, Reviewed-by,
+        //     …) has that shape, while conventional-commit subjects and
+        //     prose keys (feat:, archive:) can never match. The canonical
+        //     trailerKeys keep the local prefix semantics; any other `-by`
+        //     key mirrors the local noncanonical gate exactly: only an
+        //     exact catalogue-name value or a `Name <email>` identity
+        //     shape denies — `Reviewed-by: Copilot was discussed` stays.
+        // Exotic non-`-by` trailer keys and loose prose values remain
+        // CLI-detected only — a documented server-side gap, never a false
+        // rejection.
         let by_key = "[A-Za-z][A-Za-z0-9-]*-by";
+        let canonical_alt = self
+            .trailer_keys
+            .iter()
+            .map(|k| re2_escape(k))
+            .collect::<Vec<_>>()
+            .join("|");
 
         let mut rules = vec![
             RulesetRule {
                 rule_type: "commit_message_pattern",
-                name: "deny listed names in -by trailer values".into(),
+                name: "deny listed names in canonical trailer values".into(),
                 pattern: format!(
-                    "(?im)^{by_key}:[ \\t]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                    "(?im)\\n(?:{canonical_alt}):[ \\t]*(?:{names_alt})(?:$|[^A-Za-z0-9])"
+                ),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny exact listed names in -by trailer values".into(),
+                pattern: format!("(?im)\\n{by_key}:[ \\t]*(?:{names_alt})[ \\t]*$"),
+            },
+            RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny listed names in -by trailer identity values".into(),
+                pattern: format!(
+                    "(?im)\\n{by_key}:[ \\t]*(?:{names_alt})(?:[^A-Za-z0-9\\n][^<\\n]*)?<[^>\\n]*@"
                 ),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny listed addresses in -by trailer brackets".into(),
-                pattern: format!("(?im)^{by_key}:[^<\\n]*<(?:{addr_alt})>"),
+                pattern: format!("(?im)\\n{by_key}:[^<\\n]*<(?:{addr_alt})>"),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny listed names in bare Name <email> lines".into(),
                 pattern: format!(
-                    "(?im)^(?:{names_alt})(?:[^A-Za-z0-9\\n][^<\\n]*)?<[^>\\n]*@"
+                    "(?im)\\n(?:{names_alt})(?:[^A-Za-z0-9\\n][^<\\n]*)?<[^>\\n]*@"
                 ),
             },
             RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny bare listed address lines".into(),
-                pattern: format!("(?im)^<?(?:{addr_alt})>?[ \\t]*$"),
+                pattern: format!("(?im)\\n<?(?:{addr_alt})>?[ \\t]*$"),
             },
             RulesetRule {
                 // Catalogue names anchor at the badge-label start (local
@@ -601,7 +626,7 @@ impl Policy {
                 rule_type: "commit_message_pattern",
                 name: "deny generated-with badges naming denied identities".into(),
                 pattern: format!(
-                    "(?im)^[^\\w\\s]{{0,3}}\\s*generated\\s+with\\s*\\[?\\s*(?:(?:{names_alt})(?:$|[^A-Za-z0-9])|[^\\]\\(\\n]*(?:{shape_names_alt}))"
+                    "(?im)\\n[\\p{{P}}\\p{{S}}]{{0,3}}[^\\S\\n]*generated[^\\S\\n]+with[^\\S\\n]*\\[?[^\\S\\n]*(?:(?:{names_alt})(?:$|[^A-Za-z0-9])|[^\\]\\(\\n]*(?:{shape_names_alt}))"
                 ),
             },
             RulesetRule {
@@ -620,21 +645,21 @@ impl Policy {
                 rule_type: "commit_message_pattern",
                 name: "deny agent-shaped names in -by identity trailers".into(),
                 pattern: format!(
-                    "(?im)^{by_key}:[ \\t]*[^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
+                    "(?im)\\n{by_key}:[ \\t]*[^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
                 ),
             });
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny agent-shaped bare -by trailer tokens".into(),
                 pattern: format!(
-                    "(?im)^{by_key}:[ \\t]*[^ \\t\\n]*(?:{shape_names_alt})[^ \\t\\n]*[ \\t]*$"
+                    "(?im)\\n{by_key}:[ \\t]*[^ \\t\\n]*(?:{shape_names_alt})[^ \\t\\n]*[ \\t]*$"
                 ),
             });
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny agent-shaped names in bare Name <email> lines".into(),
                 pattern: format!(
-                    "(?im)^[^ \\t\\n<][^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
+                    "(?im)\\n[^ \\t\\n<][^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
                 ),
             });
         }
@@ -642,13 +667,13 @@ impl Policy {
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny agent-shaped addresses in -by trailer brackets".into(),
-                pattern: format!("(?im)^{by_key}:[^<\\n]*<[^@>\\n]*(?:{shape_addr_alt})[^@>\\n]*@"),
+                pattern: format!("(?im)\\n{by_key}:[^<\\n]*<[^@>\\n]*(?:{shape_addr_alt})[^@>\\n]*@"),
             });
             rules.push(RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny bare agent-shaped address lines".into(),
                 pattern: format!(
-                    "(?im)^<?[^>@\\s]*(?:{shape_addr_alt})[^>@\\s]*@[^>\\s]*>?[ \\t]*$"
+                    "(?im)\\n<?[^>@\\s]*(?:{shape_addr_alt})[^>@\\s]*@[^>\\s]*>?[ \\t]*$"
                 ),
             });
             rules.push(RulesetRule {
@@ -930,6 +955,8 @@ mod tests {
             "fix: t\n\nfactory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>\n",
             "feat: y\n\n🤖 Generated with [Claude Code](https://claude.ai/code)\n",
             "fix: t\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n",
+            "fix: t\n\nReviewed-by: Claude Code\n",
+            "fix: t\n\nX-Custom-by: Claude Code <jane@corp.com>\n",
         ] {
             let (_, removed) = strip_denied(msg, &p);
             assert!(!removed.is_empty(), "classifier should deny: {msg}");
@@ -945,6 +972,9 @@ mod tests {
             "fix: t\n\nnotes: talked to the agent yesterday\n",
             "fix: t\n\nwe use dependabot[bot] for updates\n",
             "feat: x\n\n🤖 Generated with [SomeTool](https://example.com/agent)\n",
+            "fix: t\n\nX-Custom-by: Claude Code but not a trailer\n",
+            "fix: t\n\nReviewed-by: Copilot was discussed\n",
+            "Reviewed-by: Claude Code\n",
         ] {
             let (_, removed) = strip_denied(msg, &p);
             assert!(removed.is_empty(), "classifier should keep: {msg}");

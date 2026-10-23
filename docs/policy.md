@@ -77,14 +77,19 @@ commit is ever rejected server-side that the CLI would keep.
 `Policy::ruleset_patterns()` derives the GitHub `commit_message_pattern`
 RE2 rules from the catalogue at build time — the JSON carries no regex,
 so the server-side policy cannot drift from the binaries. The generated
-message rules encode the classifier's signature-position constraints:
+message rules encode the classifier's signature-position constraints —
+every pattern anchors on `\n`, so the subject line is never scanned at
+all, and no rule fires on an indented line:
 
 - **`Key:` lines** — only `*-by` keys (the attribution-key shape) are
-  denied, and only when the value is identity-shaped (`Name <email>`,
-  `<id>+login[bot]@users.noreply…`, or the exact catalogue name). Prose
-  keys like `archive:` or conventional-commit subjects (`feat:`, `fix:`)
-  never fire; exotic non-`-by` attribution keys stay a documented
-  server-side gap the CLI still catches.
+  denied. The canonical `trailerKeys` keep the local prefix semantics
+  (`Co-Authored-By: Claude Sonnet 5 <…>`); any other `-by` key mirrors
+  the local noncanonical gate exactly — an exact catalogue-name value
+  (`X-Custom-by: Claude Code`) or an identity-shaped value
+  (`Reviewed-by: Claude Code <jane@corp.com>`). Prose values never fire:
+  `Reviewed-by: Copilot was discussed` and `archive:` lines stay, and
+  exotic non-`-by` attribution keys stay a documented server-side gap
+  the CLI still catches.
 - **Bare identity lines** — `Name <email>` with a denied name or shape,
   or a bare denied address/login token.
 - **Generated-with badges** — denied names anchor at the badge-label

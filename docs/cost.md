@@ -11,9 +11,11 @@ runner job (`ubuntu-latest`) per attribution-relevant event.
 | Quantity | Value | Source |
 |---|---|---|
 | Billing basis | Public repositories use **zero billed minutes** on GitHub-hosted runners; private repositories would consume the plan's included minutes first | GitHub Docs — *About billing for GitHub Actions*: <https://docs.github.com/en/billing/concepts/product-billing/github-actions> ("GitHub Actions usage is free for standard GitHub-hosted runners in public repositories") |
-| Trigger volume | One job per `push`, `pull_request`, or `merge_group` event — bounded by human commit activity; no schedules, no matrix, single job | this workflow |
-| Per-run wall time | ~10 s (release asset present) or ~60–90 s (cold `cargo build --release` fallback, until a `cya` release exists) | measured locally: `cargo build --release` ≈ 40 s clean on this codebase |
-| Network per run | One repo fetch (`fetch-depth: 0`, ≈ 1 MB git data at current size), one release-asset or crates.io download (≈ 5 MB), optional policy fetch only if `CYA_POLICY_URL` is set (single HTTPS GET) | this workflow |
+| Trigger volume | One job per `push`, `pull_request`, or `merge_group` event in repos that reference the workflow — bounded by human commit activity; no schedules, no matrix, single job | this workflow |
+| `workflow_call` volume | Caller-defined — the workflow is also reusable; each calling repo's triggers determine its frequency (same per-run cost) | this workflow `on:` block |
+| Per-run wall time | ~10 s (release asset present) or ~60–90 s (cold `cargo install --git` fallback — unmeasured estimate, until a `cya` release exists) | `cargo build --release` ≈ 40 s clean locally |
+| Network per run, release path | One repo fetch (`fetch-depth: 0`, ≈ 1 MB git data at current size) + one release-asset download (≈ 5 MB) + optional policy fetch only if `CYA_POLICY_URL` is set (single HTTPS GET) | this workflow |
+| Network per run, source fallback | Same repo fetch, plus the `cargo install --git` source fetch and crates.io index + dependency downloads (tens of MB, unmeasured) — eliminated once a release exists | this workflow |
 | Storage | No artifacts, caches, or deployments; runner state is ephemeral | this workflow |
 
 Known cost trade-offs, all deliberate:
