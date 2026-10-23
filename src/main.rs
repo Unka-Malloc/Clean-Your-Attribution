@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use attribution_gate::{
-    Findings, IdentityHit, Policy, identity_agent, load_policy, message_findings, strip_denied,
+    identity_agent, load_policy, message_findings, strip_denied, Findings, IdentityHit, Policy,
 };
 use std::env;
 use std::fs;
@@ -51,7 +51,12 @@ fn report(label: &str, findings: &Findings) -> usize {
 }
 
 fn default_range() -> String {
-    if let Some(up) = try_git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]) {
+    if let Some(up) = try_git(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ]) {
         return format!("{up}..HEAD");
     }
     if try_git(&["rev-parse", "--verify", "origin/HEAD"]).is_some() {
@@ -101,7 +106,11 @@ fn commit_findings(c: &Commit, policy: &Policy) -> Findings {
     let mut f = message_findings(&c.message, policy);
     for (field, name, email) in [
         ("author", c.author_name.as_str(), c.author_email.as_str()),
-        ("committer", c.committer_name.as_str(), c.committer_email.as_str()),
+        (
+            "committer",
+            c.committer_name.as_str(),
+            c.committer_email.as_str(),
+        ),
     ] {
         if let Some(agent) = identity_agent(name, email, policy) {
             f.identities.push(IdentityHit {
@@ -119,7 +128,17 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
         let hits = report("stdin", &message_findings(&buf, policy));
-        println!("{}", if hits > 0 { format!("stdin: {hits} denied attribution entr{}", if hits > 1 { "ies" } else { "y" }) } else { "stdin: clean".into() });
+        println!(
+            "{}",
+            if hits > 0 {
+                format!(
+                    "stdin: {hits} denied attribution entr{}",
+                    if hits > 1 { "ies" } else { "y" }
+                )
+            } else {
+                "stdin: clean".into()
+            }
+        );
         return Ok(if hits > 0 { 1 } else { 0 });
     }
     if has_flag(argv, "--pre-push") {
@@ -135,7 +154,8 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
             let range = if remote_sha != ZERO_SHA {
                 format!("{remote_sha}..{local_sha}")
             } else {
-                let base = try_git(&["merge-base", local_sha, "origin/HEAD"]).unwrap_or_else(|| "HEAD".into());
+                let base = try_git(&["merge-base", local_sha, "origin/HEAD"])
+                    .unwrap_or_else(|| "HEAD".into());
                 format!("{base}..{local_sha}")
             };
             let commits = commits_in_range(&range)
@@ -148,7 +168,17 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
                 );
             }
         }
-        println!("{}", if hits > 0 { format!("pre-push: {hits} denied entr{} — run `cya clean`", if hits > 1 { "ies" } else { "y" }) } else { "pre-push: clean".into() });
+        println!(
+            "{}",
+            if hits > 0 {
+                format!(
+                    "pre-push: {hits} denied entr{} — run `cya clean`",
+                    if hits > 1 { "ies" } else { "y" }
+                )
+            } else {
+                "pre-push: clean".into()
+            }
+        );
         return Ok(if hits > 0 { 1 } else { 0 });
     }
     let range = flag_value(argv, "--range").unwrap_or_else(default_range);
@@ -160,7 +190,11 @@ fn cmd_scan(argv: &[String], policy: &Policy) -> Result<i32> {
     println!(
         "{}",
         if hits > 0 {
-            format!("{range}: {hits} denied attribution entr{} in {} commit(s)", if hits > 1 { "ies" } else { "y" }, commits.len())
+            format!(
+                "{range}: {hits} denied attribution entr{} in {} commit(s)",
+                if hits > 1 { "ies" } else { "y" },
+                commits.len()
+            )
         } else {
             format!("{range}: clean ({} commit(s))", commits.len())
         }
@@ -212,7 +246,8 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
     // Denied author/committer fields are replaced by the repository's own
     // identity — the human operator takes ownership of the rewritten commits.
     let repo_name = try_git(&["config", "user.name"]).unwrap_or_else(|| "Unknown".into());
-    let repo_email = try_git(&["config", "user.email"]).unwrap_or_else(|| "unknown@localhost".into());
+    let repo_email =
+        try_git(&["config", "user.email"]).unwrap_or_else(|| "unknown@localhost".into());
     let mut touched = 0usize;
     for rev in &revs {
         let line = git(&["rev-list", "--parents", "-n1", rev])?;
@@ -228,7 +263,10 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
         let author_denied = identity_agent(&c.author_name, &c.author_email, policy).is_some();
         let committer_denied =
             identity_agent(&c.committer_name, &c.committer_email, policy).is_some();
-        let unchanged = new_parents == parents && new_message == c.message && !author_denied && !committer_denied;
+        let unchanged = new_parents == parents
+            && new_message == c.message
+            && !author_denied
+            && !committer_denied;
         let new_sha = if unchanged {
             rev.clone()
         } else {
@@ -240,11 +278,39 @@ fn cmd_clean(argv: &[String], policy: &Policy) -> Result<i32> {
                 args.push(p.clone());
             }
             let envs = [
-                ("GIT_AUTHOR_NAME", if author_denied { &repo_name } else { &c.author_name }),
-                ("GIT_AUTHOR_EMAIL", if author_denied { &repo_email } else { &c.author_email }),
+                (
+                    "GIT_AUTHOR_NAME",
+                    if author_denied {
+                        &repo_name
+                    } else {
+                        &c.author_name
+                    },
+                ),
+                (
+                    "GIT_AUTHOR_EMAIL",
+                    if author_denied {
+                        &repo_email
+                    } else {
+                        &c.author_email
+                    },
+                ),
                 ("GIT_AUTHOR_DATE", &c.author_date),
-                ("GIT_COMMITTER_NAME", if committer_denied { &repo_name } else { &c.committer_name }),
-                ("GIT_COMMITTER_EMAIL", if committer_denied { &repo_email } else { &c.committer_email }),
+                (
+                    "GIT_COMMITTER_NAME",
+                    if committer_denied {
+                        &repo_name
+                    } else {
+                        &c.committer_name
+                    },
+                ),
+                (
+                    "GIT_COMMITTER_EMAIL",
+                    if committer_denied {
+                        &repo_email
+                    } else {
+                        &c.committer_email
+                    },
+                ),
                 ("GIT_COMMITTER_DATE", &c.committer_date),
             ];
             let mut child = Command::new("git")
@@ -281,28 +347,45 @@ fn cmd_hook(argv: &[String]) -> Result<i32> {
     // Repo-scoped install. When a global core.hooksPath is in effect (e.g.
     // GitVault's dispatcher), .git/hooks never fires — the convention on
     // such machines is a repo-local `.githooks/` the dispatcher chains to.
-    let dir = flag_value(argv, "--dir").map(PathBuf::from).or_else(|| {
-        let top = try_git(&["rev-parse", "--show-toplevel"]).map(PathBuf::from)?;
-        let custom = try_git(&["config", "--get", "core.hooksPath"]);
-        Some(match custom {
-            Some(_) => top.join(".githooks"),
-            None => top.join(".git/hooks"),
+    let dir = flag_value(argv, "--dir")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let top = try_git(&["rev-parse", "--show-toplevel"]).map(PathBuf::from)?;
+            let custom = try_git(&["config", "--get", "core.hooksPath"]);
+            Some(match custom {
+                Some(_) => top.join(".githooks"),
+                None => top.join(".git/hooks"),
+            })
         })
-    }).context("not inside a git work tree")?;
+        .context("not inside a git work tree")?;
     if dir.ends_with(".githooks") {
         eprintln!("cya: global core.hooksPath detected — installing repo-local .githooks/ for dispatcher chaining");
     }
     fs::create_dir_all(&dir)?;
     let exe = current_exe()?;
     let hooks = [
-        ("commit-msg", format!("#!/bin/sh\n{HOOK_MARKER}\n'{}' strip-file \"$1\"\n", exe.display())),
-        ("pre-push", format!("#!/bin/sh\n{HOOK_MARKER}\nexec '{}' scan --pre-push\n", exe.display())),
+        (
+            "commit-msg",
+            format!(
+                "#!/bin/sh\n{HOOK_MARKER}\n'{}' strip-file \"$1\"\n",
+                exe.display()
+            ),
+        ),
+        (
+            "pre-push",
+            format!(
+                "#!/bin/sh\n{HOOK_MARKER}\nexec '{}' scan --pre-push\n",
+                exe.display()
+            ),
+        ),
     ];
     let mut code = 0;
     for (name, content) in hooks {
         let path = dir.join(name);
         if path.exists()
-            && !fs::read_to_string(&path).unwrap_or_default().contains(HOOK_MARKER)
+            && !fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains(HOOK_MARKER)
             && !has_flag(argv, "--force")
         {
             eprintln!("cya: {name} hook exists and is not ours — merge manually or pass --force");
@@ -326,7 +409,11 @@ fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
                 "agent {:?} has neither names nor addresses",
                 a.id
             );
-            anyhow::ensure!(!a.verify.is_empty(), "agent {:?} lacks a verify reference", a.id);
+            anyhow::ensure!(
+                !a.verify.is_empty(),
+                "agent {:?} lacks a verify reference",
+                a.id
+            );
         }
         for r in policy.ruleset_patterns() {
             anyhow::ensure!(
@@ -344,6 +431,11 @@ fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
     }
     println!("source: {}", policy.source);
     println!("trailerKeys: {}", policy.trailer_keys.join(", "));
+    println!("shape names: {}", policy.shape_names.join(", "));
+    println!(
+        "shape addressLocals: {}",
+        policy.shape_addr_locals.join(", ")
+    );
     for a in &policy.agents {
         println!("agent [{}] ({})", a.id, a.verify);
         for n in &a.names {
@@ -366,7 +458,9 @@ fn has_flag(argv: &[String], name: &str) -> bool {
 }
 
 fn flag_value(argv: &[String], name: &str) -> Option<String> {
-    argv.iter().position(|a| a == name).and_then(|i| argv.get(i + 1).cloned())
+    argv.iter()
+        .position(|a| a == name)
+        .and_then(|i| argv.get(i + 1).cloned())
 }
 
 const USAGE: &str = "cya — clean your attribution

@@ -1,8 +1,13 @@
 {
-  "version": 2,
+  "version": 3,
   "updated": "2026-10-23",
-  "matchNote": "Precise-match catalogue: an attribution trailer or generated-with badge is denied only when it claims one of the verified official agent identities below (by display name or by address). Human co-authors — including names that merely resemble an agent or squatted accounts — are preserved. Entries must carry a verify reference; unverified identities are listed separately and are NOT denied.",
+  "matchNote": "Precise-match catalogue plus attribution-position shapes: a trailer, generated-with badge, or author/committer identity is denied when it claims one of the verified official identities below, or when the identity itself is obviously agent-shaped per the shape lists. Shapes apply ONLY in attribution positions — author/committer fields and identity-shaped trailer values (Name <addr> or bare login) — never to prose or source text. Human co-authors — including names that merely resemble an agent or squatted accounts — are preserved. Entries must carry a verify reference; unverified identities are listed separately and are NOT denied.",
   "trailerKeys": ["Co-authored-by", "Generated-by", "Assisted-by"],
+  "shape": {
+    "note": "Brute-force substrings matched only in attribution positions: author/committer name+email and trailer values that are identity-shaped (Name <addr> or a bare single-token login). Prose values, indented lines and bare message text are never shape-matched.",
+    "names": ["[bot]", "agent"],
+    "addressLocals": ["[bot]", "agent"]
+  },
   "agents": [
     {
       "id": "openai-codex",

@@ -10,10 +10,10 @@
 //! with --identity personal — the credential never leaves the vault
 //! process; this binary only receives API responses.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use attribution_gate::load_policy;
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::process::Command;
@@ -37,7 +37,12 @@ fn parse_args() -> Result<Args> {
         argv.iter()
             .position(|a| a == name)
             .and_then(|i| argv.get(i + 1))
-            .map(|v| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let enforcement = argv
@@ -96,7 +101,10 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     argv.push("-H".into());
     argv.push("X-GitHub-Api-Version: 2022-11-28".into());
     argv.push(format!("https://api.github.com{path}"));
-    let out = Command::new("curl").args(&argv).output().context("curl failed")?;
+    let out = Command::new("curl")
+        .args(&argv)
+        .output()
+        .context("curl failed")?;
     drop(tmp);
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
@@ -217,7 +225,11 @@ const MERGE_SETTINGS: &str = r#"{
 fn list_repos(args: &Args) -> Result<Vec<String>> {
     let mut named: Vec<String> = args.repos.clone();
     for org in &args.orgs {
-        let page = api("GET", &format!("/orgs/{org}/repos?per_page=100&type=all"), None)?;
+        let page = api(
+            "GET",
+            &format!("/orgs/{org}/repos?per_page=100&type=all"),
+            None,
+        )?;
         for r in page.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
             if let Some(name) = r.get("full_name").and_then(Value::as_str) {
                 named.push(name.into());
@@ -225,7 +237,11 @@ fn list_repos(args: &Args) -> Result<Vec<String>> {
         }
     }
     for user in &args.users {
-        let page = api("GET", &format!("/users/{user}/repos?per_page=100&type=owner"), None)?;
+        let page = api(
+            "GET",
+            &format!("/users/{user}/repos?per_page=100&type=owner"),
+            None,
+        )?;
         for r in page.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
             if let Some(name) = r.get("full_name").and_then(Value::as_str) {
                 named.push(name.into());
@@ -256,7 +272,11 @@ fn ensure_workflow(owner: &str, repo: &str, workflow_content: &str, dry_run: boo
     if dry_run {
         println!(
             "    workflow: would {} {WORKFLOW_PATH}",
-            if existing.is_some() { "update" } else { "create" }
+            if existing.is_some() {
+                "update"
+            } else {
+                "create"
+            }
         );
         return Ok(());
     }
@@ -264,13 +284,18 @@ fn ensure_workflow(owner: &str, repo: &str, workflow_content: &str, dry_run: boo
         "message": "chore(attribution): install attribution-gate check workflow",
         "content": B64.encode(workflow_content),
     });
-    if let Some(sha) = existing.and_then(|v| v.get("sha").and_then(Value::as_str).map(String::from)) {
+    if let Some(sha) = existing.and_then(|v| v.get("sha").and_then(Value::as_str).map(String::from))
+    {
         body["sha"] = json!(sha);
     }
     api("PUT", &path, Some(&body))?;
     println!(
         "    workflow: {}",
-        if body.get("sha").is_some() { "updated" } else { "created" }
+        if body.get("sha").is_some() {
+            "updated"
+        } else {
+            "created"
+        }
     );
     Ok(())
 }
@@ -281,12 +306,19 @@ fn ensure_ruleset(owner: &str, repo: &str, desired: &Value, dry_run: bool) -> Re
     let name = desired["name"].as_str().unwrap_or_default();
     let existing = list
         .as_array()
-        .and_then(|a| a.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(name)))
+        .and_then(|a| {
+            a.iter()
+                .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
+        })
         .and_then(|r| r.get("id").and_then(Value::as_i64));
     if dry_run {
         println!(
             "    ruleset {name}: would {} ({})",
-            if existing.is_some() { "update" } else { "create" },
+            if existing.is_some() {
+                "update"
+            } else {
+                "create"
+            },
             desired["enforcement"].as_str().unwrap_or("?")
         );
         return Ok(());
@@ -315,7 +347,9 @@ fn main() -> Result<()> {
     );
     let mut failures = Vec::new();
     for full in &repos {
-        let (owner, repo) = full.split_once('/').context(format!("bad repo name {full}"))?;
+        let (owner, repo) = full
+            .split_once('/')
+            .context(format!("bad repo name {full}"))?;
         let meta = api("GET", &format!("/repos/{owner}/{repo}"), None)?;
         if meta["private"].as_bool().unwrap_or(false) && !args.include_private {
             println!("  {full}: skipped (private — server-side enforcement needs a paid plan)");
@@ -324,12 +358,26 @@ fn main() -> Result<()> {
         println!("  {full}:");
         let run = || -> Result<()> {
             ensure_workflow(owner, repo, workflow_content, args.dry_run)?;
-            ensure_ruleset(owner, repo, &ruleset_deny_trailers(&args.enforcement, &policy), args.dry_run)?;
-            ensure_ruleset(owner, repo, &ruleset_default_branch(&args.enforcement), args.dry_run)?;
+            ensure_ruleset(
+                owner,
+                repo,
+                &ruleset_deny_trailers(&args.enforcement, &policy),
+                args.dry_run,
+            )?;
+            ensure_ruleset(
+                owner,
+                repo,
+                &ruleset_default_branch(&args.enforcement),
+                args.dry_run,
+            )?;
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");
             } else {
-                api("PATCH", &format!("/repos/{owner}/{repo}"), Some(&merge_settings))?;
+                api(
+                    "PATCH",
+                    &format!("/repos/{owner}/{repo}"),
+                    Some(&merge_settings),
+                )?;
                 println!("    settings: squash-only + PR title");
             }
             Ok(())
@@ -342,7 +390,11 @@ fn main() -> Result<()> {
     if failures.is_empty() {
         println!("done");
     } else {
-        println!("done with {} failure(s): {}", failures.len(), failures.join(", "));
+        println!(
+            "done with {} failure(s): {}",
+            failures.len(),
+            failures.join(", ")
+        );
         std::process::exit(1);
     }
     Ok(())

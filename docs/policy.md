@@ -22,23 +22,48 @@ or `github.com/factory-droid` that merely *look* like the agent's name.
 
 ## Match semantics — full domain
 
-A verified identity is denied **wherever it appears in complete form**:
+A denied identity is matched **wherever it appears in complete form**:
 
 - **Author and committer fields.** Agents sign commits directly —
   `copilot-swe-agent[bot]`, `factory-droid[bot]` and `devin-ai-integration[bot]`
   author commits with no trailer at all. `cya scan` reports them;
   `cya clean` rewrites the field to the repository's own `user.name` /
   `user.email`, so the human operator takes ownership.
-- **Any `Key:` line**, not only the canonical attribution keys:
-  `Co-authored-by`, `Signed-off-by`, `Reviewed-by`, or whatever key a tool
-  invents — the value is matched by name or address.
-- **Bare `Name <addr>` lines and bare-address lines** anywhere in the
-  message, plus `… Generated with <name>` badge lines.
-- Indented lines never match: a body quoting a trailer as an example keeps
-  it. Wrapped continuation lines of a denied trailer are removed with it.
+- **Canonical `trailerKeys`** (`Co-authored-by`, `Generated-by`,
+  `Assisted-by`) match loosely: the whole value may prefix-match a
+  catalogue name (`Generated-by: Claude Code:model`).
+- **Any other `Key:` line** matches only when its value is
+  identity-shaped — `Name <addr>` carrying an email or a bare single-token
+  login — or when the value is exactly a catalogue name. Prose values
+  (`archive: OpenAI Codex under the bin dir`) are not attribution.
+- **Bare `Name <addr>` lines and bare-address lines** in the body, plus
+  `… Generated with <name>` badges; the bracket must carry an email so
+  code placeholders like `<agent>` stay prose.
+- **The subject line** (first non-empty line) is never a trailer: a
+  conventional-commit `type: token` subject stays untouched.
+- Indented lines never match. Wrapped continuation lines of a denied
+  trailer are removed with it.
 - Everything else survives verbatim: human co-authors on any address,
   sign-offs by humans, model ids that name no verified identity
   (`Generated-by: gpt-5`).
+
+## Agent shapes — brute force in attribution positions only
+
+Besides the verified catalogue, the `shape` block denies identities that
+are *obviously* agent-shaped even when the tool is unlisted:
+
+- `shape.names` (`[bot]`, `agent`) — substring of the display name in an
+  attribution position: `dependabot[bot]`, `github-actions[bot]`,
+  `Random Agent` as author/committer or in an identity trailer value.
+- `shape.addressLocals` (`[bot]`, `agent`) — substring of the address
+  local part in the same positions: `copilot-swe-agent`, `cursoragent`.
+
+Shapes never fire in prose, in code, or on the subject line — only where
+an identity legitimately stands: the two identity fields and
+identity-shaped trailer values. The trade-off is deliberate: a human
+literally named "Agent Smith" or an account like `agent.smith@corp.com`
+in an attribution position is collateral the operator accepts in exchange
+for catching every future unlisted agent.
 
 Server side, the same coverage maps to ruleset rule types: five
 `commit_message_pattern` rules plus `commit_author_email_pattern` and

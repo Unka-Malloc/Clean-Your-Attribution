@@ -7,7 +7,7 @@
 //! identities by display name or by address. Human co-authors —
 //! including names that merely resemble an agent — are preserved.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use std::process::Command;
@@ -23,6 +23,16 @@ struct PolicyFile {
     trailer_keys: Vec<String>,
     #[serde(default)]
     agents: Vec<AgentSpec>,
+    #[serde(default)]
+    shape: Option<ShapeSpec>,
+}
+
+#[derive(Deserialize)]
+struct ShapeSpec {
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default, rename = "addressLocals")]
+    address_locals: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +65,13 @@ pub struct Policy {
     /// inspected); the field remains the preset-floor contract.
     pub trailer_keys: Vec<String>,
     pub agents: Vec<Agent>,
+    /// Brute-force substrings (lowercased) that mark an identity as an
+    /// agent — applied ONLY in attribution positions: author/committer
+    /// fields and identity-shaped trailer values. Never prose, never
+    /// source text. `shape_names` applies to display names,
+    /// `shape_addr_locals` to the address local part.
+    pub shape_names: Vec<String>,
+    pub shape_addr_locals: Vec<String>,
     pub source: String,
 }
 
@@ -76,9 +93,20 @@ fn parse_policy(json: &str, source: &str) -> Result<Policy> {
             addresses: spec.addresses.iter().map(|a| a.to_lowercase()).collect(),
         });
     }
+    let (shape_names, shape_addr_locals) = raw
+        .shape
+        .map(|s| {
+            (
+                s.names.iter().map(|n| n.to_lowercase()).collect(),
+                s.address_locals.iter().map(|n| n.to_lowercase()).collect(),
+            )
+        })
+        .unwrap_or_default();
     Ok(Policy {
         trailer_keys,
         agents,
+        shape_names,
+        shape_addr_locals,
         source: source.into(),
     })
 }
@@ -117,6 +145,18 @@ pub fn validate_against_preset(effective: &Policy) -> Result<()> {
             );
         }
     }
+    for s in &preset.shape_names {
+        ensure!(
+            effective.shape_names.contains(s),
+            "policy drops shape name {s:?} (preset floor: additions allowed, removals not)"
+        );
+    }
+    for s in &preset.shape_addr_locals {
+        ensure!(
+            effective.shape_addr_locals.contains(s),
+            "policy drops shape address-local {s:?} (preset floor: additions allowed, removals not)"
+        );
+    }
     Ok(())
 }
 
@@ -133,7 +173,10 @@ pub fn load_policy(policy_url: Option<&str>) -> Result<Policy> {
             .output()
             .context("failed to launch curl")?;
         ensure!(out.status.success(), "policy fetch failed: {url}");
-        (String::from_utf8(out.stdout).context("policy fetch not utf-8")?, url)
+        (
+            String::from_utf8(out.stdout).context("policy fetch not utf-8")?,
+            url,
+        )
     } else {
         (POLICY_JSON.to_string(), "bundled".to_string())
     };
@@ -151,8 +194,12 @@ pub fn load_policy(policy_url: Option<&str>) -> Result<Policy> {
 fn name_matches(candidate: &str, agent: &Agent) -> bool {
     let c = candidate.trim().to_lowercase();
     agent.names.iter().any(|n| {
-        c == *n || (c.starts_with(n.as_str())
-            && c[n.len()..].chars().next().map_or(false, |ch| !ch.is_alphanumeric()))
+        c == *n
+            || (c.starts_with(n.as_str())
+                && c[n.len()..]
+                    .chars()
+                    .next()
+                    .map_or(false, |ch| !ch.is_alphanumeric()))
     })
 }
 
@@ -166,10 +213,11 @@ fn addr_matches(addr: &str, agent: &Agent) -> bool {
     if let Some(local) = a.strip_suffix("@users.noreply.github.com") {
         let bare = local.split_once('+').map(|(_, l)| l).unwrap_or(local);
         return agent.addresses.iter().any(|x| {
-            x.strip_suffix("@users.noreply.github.com").is_some_and(|xl| {
-                let xb = xl.split_once('+').map(|(_, l)| l).unwrap_or(xl);
-                bare == xb
-            })
+            x.strip_suffix("@users.noreply.github.com")
+                .is_some_and(|xl| {
+                    let xb = xl.split_once('+').map(|(_, l)| l).unwrap_or(xl);
+                    bare == xb
+                })
         });
     }
     false
@@ -196,11 +244,66 @@ static GENERATED_WITH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^[^\w\s]{0,3}\s*generated\s+with\s+").unwrap());
 
 /// The agent id a `name <addr>` pair or a bare name/addr resolves to.
+/// The verified catalogue wins; then the brute-force shapes fire — but
+/// shapes are only consulted here, inside attribution positions, so a
+/// "bot"/"agent" word in prose or source is never matched.
 fn find_agent(name: &str, addr: Option<&str>, policy: &Policy) -> Option<String> {
-    policy
+    if let Some(a) = policy
         .agents
         .iter()
         .find(|a| name_matches(name, a) || addr.is_some_and(|x| addr_matches(x, a)))
+    {
+        return Some(a.id.clone());
+    }
+    shape_agent(name, addr, policy)
+}
+
+/// Obviously agent-shaped identity: `[bot]`/`agent` in the display name or
+/// in the address local part (dependabot[bot], copilot-swe-agent, …).
+fn shape_agent(name: &str, addr: Option<&str>, policy: &Policy) -> Option<String> {
+    let n = name.trim().to_lowercase();
+    if policy
+        .shape_names
+        .iter()
+        .any(|s| !s.is_empty() && n.contains(s.as_str()))
+    {
+        return Some("agent-shaped:name".into());
+    }
+    if let Some(a) = addr {
+        let local = a.trim().to_lowercase();
+        let local = local.split('@').next().unwrap_or("");
+        if policy
+            .shape_addr_locals
+            .iter()
+            .any(|s| !s.is_empty() && local.contains(s.as_str()))
+        {
+            return Some("agent-shaped:address".into());
+        }
+    }
+    None
+}
+
+/// A trailer value shaped like an identity: `Name <addr>` carrying an
+/// email, or a bare single-token login. Prose values — sentences with
+/// spaces and no brackets — are not attribution and stay untouched; this
+/// keeps lines like `archive: OpenAI Codex under the bin dir` out.
+fn identity_shaped(value: &str) -> bool {
+    let (name, addr) = split_name_addr(value);
+    match addr {
+        Some(a) => a.contains('@'),
+        None => !name.is_empty() && !name.contains(char::is_whitespace) && name.len() <= 64,
+    }
+}
+
+/// Whole-value exact match against catalogue names — used for non-canonical
+/// `Key:` lines whose value is not identity-shaped, so `X-Custom: Claude
+/// Code` still denies while prose values starting with an agent name do not.
+fn exact_name_agent(value: &str, policy: &Policy) -> Option<String> {
+    let v = value.trim().to_lowercase();
+    policy
+        .agents
+        .iter()
+        .find(|a| a.names.iter().any(|n| v == *n))
         .map(|a| a.id.clone())
 }
 
@@ -208,23 +311,42 @@ fn find_agent(name: &str, addr: Option<&str>, policy: &Policy) -> Option<String>
 /// attribution line — a `Key: Name <addr>` trailer of ANY key, a bare
 /// `Name <addr>` or bare-address full line, or a `Generated with <name>`
 /// badge. Indented lines never match: a body quoting a trailer as an
-/// example keeps it. `None` means the line stays.
-fn attribution_agent(line: &str, policy: &Policy) -> Option<String> {
+/// example keeps it. `is_subject` marks the first non-empty line: a
+/// non-canonical `key:` there is a conventional-commit subject
+/// (`converge: agent/retire-…`), never a trailer. `None` means the
+/// line stays.
+fn attribution_agent(line: &str, is_subject: bool, policy: &Policy) -> Option<String> {
     if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
         return None;
     }
     if let Some(caps) = KEY_LINE.captures(line) {
-        let (name, addr) = split_name_addr(&caps[2]);
-        return find_agent(name, addr, policy);
+        let key = caps[1].to_lowercase();
+        let value = &caps[2];
+        if is_subject && !policy.trailer_keys.contains(&key) {
+            return None;
+        }
+        let (name, addr) = split_name_addr(value);
+        // Canonical attribution keys trust the whole value. Any other
+        // `Key:` line must carry an identity-shaped value — a `Name
+        // <addr>` or a bare login — or, failing that, a value that is
+        // exactly a catalogue name; prose values are not attribution.
+        if policy.trailer_keys.contains(&key) {
+            return find_agent(name, addr, policy);
+        }
+        if identity_shaped(value) {
+            return find_agent(name, addr, policy);
+        }
+        return exact_name_agent(value, policy);
     }
     if let Some(m) = GENERATED_WITH.find(line) {
         let inner = line[m.end()..].trim_start_matches('[');
         let name = inner.split([']', '(']).next().unwrap_or("").trim();
         return find_agent(name, None, policy);
     }
-    // Bare `Name <addr>` or bare address as the whole line.
+    // Bare `Name <addr>` or bare address as the whole line — the bracket
+    // must carry an email, so code placeholders like `<agent>` stay prose.
     let (name, addr) = split_name_addr(line.trim_end());
-    if addr.is_some() {
+    if addr.is_some_and(|a| a.contains('@')) {
         return find_agent(name, addr, policy);
     }
     if !line.contains(char::is_whitespace) && line.contains('@') {
@@ -278,8 +400,11 @@ impl Findings {
 pub fn message_findings(message: &str, policy: &Policy) -> Findings {
     let normalized = message.replace("\r\n", "\n");
     let mut findings = Findings::default();
+    let mut subject_seen = false;
     for (i, line) in normalized.split('\n').enumerate() {
-        if let Some(agent) = attribution_agent(line, policy) {
+        let is_subject = !subject_seen && !line.trim().is_empty();
+        subject_seen |= is_subject;
+        if let Some(agent) = attribution_agent(line, is_subject, policy) {
             if let Some(caps) = KEY_LINE.captures(line) {
                 findings.trailers.push(TrailerHit {
                     line: i + 1,
@@ -308,13 +433,16 @@ pub fn strip_denied(message: &str, policy: &Policy) -> (String, Vec<String>) {
     let mut removed = Vec::new();
     let mut kept = Vec::new();
     let mut dropping = false;
+    let mut subject_seen = false;
     for line in normalized.split('\n') {
+        let is_subject = !subject_seen && !line.trim().is_empty();
+        subject_seen |= is_subject;
         let indented = line.starts_with(' ') || line.starts_with('\t');
         if indented && dropping && !line.trim().is_empty() {
             continue;
         }
         dropping = false;
-        match attribution_agent(line, policy) {
+        match attribution_agent(line, is_subject, policy) {
             Some(agent) => {
                 removed.push(agent);
                 // Trailer values wrap onto indented continuation lines.
@@ -393,7 +521,10 @@ impl Policy {
         exact.sort();
         exact.dedup();
         let addr_alt = if exact.is_empty() {
-            format!("(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com", noreply.join("|"))
+            format!(
+                "(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com",
+                noreply.join("|")
+            )
         } else {
             format!(
                 "(?:(?:[0-9]+\\+)?(?:{})@users\\.noreply\\.github\\.com|{})",
@@ -402,7 +533,20 @@ impl Policy {
             )
         };
 
-        vec![
+        let shape_names_alt = self
+            .shape_names
+            .iter()
+            .map(|s| re2_escape(s))
+            .collect::<Vec<_>>()
+            .join("|");
+        let shape_addr_alt = self
+            .shape_addr_locals
+            .iter()
+            .map(|s| re2_escape(s))
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let mut rules = vec![
             RulesetRule {
                 rule_type: "commit_message_pattern",
                 name: "deny listed agent names in attribution lines".into(),
@@ -444,7 +588,36 @@ impl Policy {
                 name: "deny listed agent committer addresses".into(),
                 pattern: format!("(?i)^{addr_alt}$"),
             },
-        ]
+        ];
+        if !shape_names_alt.is_empty() {
+            rules.push(RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny agent-shaped names in identity trailers".into(),
+                pattern: format!(
+                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*[^<\\n]*(?:{shape_names_alt})[^<\\n]*<[^>\\n]*@"
+                ),
+            });
+            rules.push(RulesetRule {
+                rule_type: "commit_message_pattern",
+                name: "deny agent-shaped bare-login trailer values".into(),
+                pattern: format!(
+                    "(?im)^[A-Za-z][A-Za-z0-9-]*:[ \\t]*[^ \\t\\n]*(?:{shape_names_alt})[^ \\t\\n]*[ \\t]*$"
+                ),
+            });
+        }
+        if !shape_addr_alt.is_empty() {
+            rules.push(RulesetRule {
+                rule_type: "commit_author_email_pattern",
+                name: "deny agent-shaped author addresses".into(),
+                pattern: format!("(?i)^[^@\\n]*(?:{shape_addr_alt})[^@\\n]*@"),
+            });
+            rules.push(RulesetRule {
+                rule_type: "committer_email_pattern",
+                name: "deny agent-shaped committer addresses".into(),
+                pattern: format!("(?i)^[^@\\n]*(?:{shape_addr_alt})[^@\\n]*@"),
+            });
+        }
+        rules
     }
 }
 
@@ -456,7 +629,8 @@ mod tests {
         parse_policy(POLICY_JSON, "test").unwrap()
     }
 
-    const CODEX_MSG: &str = "feat: x\n\nBody.\n\nCo-authored-by: codex <267193182+codex@users.noreply.github.com>\n";
+    const CODEX_MSG: &str =
+        "feat: x\n\nBody.\n\nCo-authored-by: codex <267193182+codex@users.noreply.github.com>\n";
 
     #[test]
     fn strips_verified_agent_coauthor_and_keeps_body() {
@@ -477,8 +651,10 @@ mod tests {
         assert!(removed.is_empty());
         assert!(text.contains("Lulot"));
         // An ordinary human co-author on any address is untouched.
-        let (text, removed) =
-            strip_denied("fix: t\n\nB.\n\nCo-authored-by: Jane Doe <jane@corp.com>\n", &policy());
+        let (text, removed) = strip_denied(
+            "fix: t\n\nB.\n\nCo-authored-by: Jane Doe <jane@corp.com>\n",
+            &policy(),
+        );
         assert!(removed.is_empty());
         assert!(text.contains("Jane Doe"));
     }
@@ -491,8 +667,10 @@ mod tests {
         let (_, removed) = strip_denied(msg, &policy());
         assert!(removed.is_empty());
         // Jules is a human first name — only the google.com address is denied.
-        let (_, removed) =
-            strip_denied("fix: t\n\nCo-authored-by: Jules <jules@example.com>\n", &policy());
+        let (_, removed) = strip_denied(
+            "fix: t\n\nCo-authored-by: Jules <jules@example.com>\n",
+            &policy(),
+        );
         assert!(removed.is_empty());
     }
 
@@ -517,12 +695,10 @@ mod tests {
 
     #[test]
     fn unverified_agent_names_are_preserved() {
-        // Not in the catalogue: model ids, squatted human logins and tools
-        // without a verified identity stay — only verified official
-        // identities are denied.
+        // Not in the catalogue and not agent-shaped: model ids, squatted
+        // human logins and tools without a verified identity stay.
         for line in [
             "Generated-by: gpt-5",
-            "Co-authored-by: unknown-bot[bot] <1+unknown-bot[bot]@users.noreply.github.com>",
             "Co-authored-by: kimi <kimi@users.noreply.github.com>",
         ] {
             let (_, removed) = strip_denied(&format!("fix: t\n\n{line}\n"), &policy());
@@ -536,6 +712,60 @@ mod tests {
             &policy(),
         );
         assert_eq!(removed, ["sweep"]);
+    }
+
+    #[test]
+    fn agent_shapes_deny_only_in_attribution_positions() {
+        // [bot]/agent shapes deny in trailer values and identity fields,
+        // even for tools that are not in the verified catalogue.
+        for line in [
+            "Co-authored-by: unknown-bot[bot] <1+unknown-bot[bot]@users.noreply.github.com>",
+            "Signed-off-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+            "Reviewed-by: Random Agent <r@x.example>",
+            "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+        ] {
+            let (_, removed) = strip_denied(&format!("fix: t\n\n{line}\n"), &policy());
+            assert_eq!(removed.len(), 1, "line: {line}");
+        }
+        assert_eq!(
+            identity_agent(
+                "dependabot[bot]",
+                "anything@users.noreply.github.com",
+                &policy()
+            ),
+            Some("agent-shaped:name".into())
+        );
+        assert_eq!(
+            identity_agent(
+                "Whatever",
+                "9+some-agent@users.noreply.github.com",
+                &policy()
+            ),
+            Some("agent-shaped:address".into())
+        );
+        // …but never in prose: a non-canonical Key line with a sentence
+        // value is not attribution, and bare message text mentioning a
+        // bot/agent word is untouched.
+        for line in [
+            "archive: OpenAI Codex under the user-local bin directory, placed home from",
+            "notes: talked to the agent yesterday",
+            "dependabot[bot] fixed it upstream",
+            "we use agents for reviews",
+            "`AdapterContract::new(\"<agent>\")`. The parser alias stays asserted",
+            "crates/licoup-agent-<agent>/src/parser.rs` and `adapters/mod.rs` names the",
+        ] {
+            let (_, removed) = strip_denied(&format!("fix: t\n\n{line}\n"), &policy());
+            assert!(removed.is_empty(), "line: {line}");
+        }
+        // The subject line is never a trailer: a conventional-commit
+        // `type: token` subject naming an agent branch stays.
+        let (_, removed) =
+            strip_denied("converge: agent/retire-ecosystem-owner-matrix\n", &policy());
+        assert!(removed.is_empty());
+        // A non-canonical key still denies when the whole value is exactly
+        // a catalogue name.
+        let (_, removed) = strip_denied("fix: t\n\nX-Custom: Claude Code\n", &policy());
+        assert_eq!(removed, ["claude"]);
     }
 
     #[test]
@@ -603,23 +833,33 @@ mod tests {
         assert_eq!(removed, ["google-jules"]);
         // Agent identities in author/committer fields deny.
         assert_eq!(
-            identity_agent("copilot-swe-agent[bot]", "anything@users.noreply.github.com", &policy()),
+            identity_agent(
+                "copilot-swe-agent[bot]",
+                "anything@users.noreply.github.com",
+                &policy()
+            ),
             Some("github-copilot".into())
         );
         assert_eq!(
-            identity_agent("Whoever", "267193182+codex@users.noreply.github.com", &policy()),
+            identity_agent(
+                "Whoever",
+                "267193182+codex@users.noreply.github.com",
+                &policy()
+            ),
             Some("openai-codex".into())
         );
-        assert_eq!(
-            identity_agent("Jane Doe", "jane@corp.com", &policy()),
-            None
-        );
+        assert_eq!(identity_agent("Jane Doe", "jane@corp.com", &policy()), None);
     }
 
     #[test]
     fn ruleset_patterns_compile() {
         for r in policy().ruleset_patterns() {
-            assert!(Regex::new(&r.pattern).is_ok(), "ruleset rule {} invalid: {}", r.name, r.pattern);
+            assert!(
+                Regex::new(&r.pattern).is_ok(),
+                "ruleset rule {} invalid: {}",
+                r.name,
+                r.pattern
+            );
         }
     }
 
@@ -634,9 +874,12 @@ mod tests {
 
         // An extra agent is fine.
         let mut added = policy_json();
-        added["agents"].as_array_mut().unwrap().push(serde_json::json!({
-            "id": "new-agent", "names": ["New Agent"], "addresses": [], "verify": "x"
-        }));
+        added["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "new-agent", "names": ["New Agent"], "addresses": [], "verify": "x"
+            }));
         let p = parse_policy(&added.to_string(), "t").unwrap();
         validate_against_preset(&p).unwrap();
 
