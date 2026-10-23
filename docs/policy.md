@@ -45,6 +45,13 @@ the server-side policy cannot drift from the binaries.
 1. `--policy-url URL` / `CYA_POLICY_URL` (remote override — lets a fleet update rules without reinstalling),
 2. `policy/trailers.json` compiled into the binaries via `include_str!` — file and binary cannot drift apart because there is one source of bytes.
 
+**Preset floor.** Every source — remote override included — is validated
+against the bundled catalogue before a single message is scanned: it may
+add trailer keys, agents, names or addresses, but dropping any preset
+element rejects the whole policy (`policy drops agent "claude" (preset
+floor: additions allowed, removals not)`). A fleet policy can only ever
+widen coverage, never silently shrink it.
+
 `cargo test` covers the match semantics; `cya policy --check` verifies the
 file parses, every agent carries a verify reference, and the generated
 ruleset patterns compile.

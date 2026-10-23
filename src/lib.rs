@@ -7,7 +7,7 @@
 //! identities by display name or by address. Human co-authors —
 //! including names that merely resemble an agent — are preserved.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use serde::Deserialize;
 use std::process::Command;
@@ -92,22 +92,63 @@ fn parse_policy(json: &str, source: &str) -> Result<Policy> {
     })
 }
 
+/// The bundled catalogue is the floor every policy source must cover:
+/// a fetched policy may *add* trailer keys, agents, names or addresses,
+/// but dropping any preset element rejects the whole policy before a
+/// single message is scanned.
+pub fn validate_against_preset(effective: &Policy) -> Result<()> {
+    let preset = parse_policy(POLICY_JSON, "bundled preset")?;
+    for key in &preset.trailer_keys {
+        ensure!(
+            effective.trailer_keys.contains(key),
+            "policy drops trailer key {key:?} (preset floor: additions allowed, removals not)"
+        );
+    }
+    for preset_agent in &preset.agents {
+        let Some(actual) = effective.agents.iter().find(|a| a.id == preset_agent.id) else {
+            bail!(
+                "policy drops agent {:?} (preset floor: additions allowed, removals not)",
+                preset_agent.id
+            );
+        };
+        for n in &preset_agent.names {
+            ensure!(
+                actual.names.contains(n),
+                "policy drops name {n:?} from agent {:?} (preset floor)",
+                preset_agent.id
+            );
+        }
+        for x in &preset_agent.addresses {
+            ensure!(
+                actual.addresses.contains(x),
+                "policy drops address {x:?} from agent {:?} (preset floor)",
+                preset_agent.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Policy resolution: `--policy-url` / `CYA_POLICY_URL` first (lets a fleet
 /// update rules without reinstalling), else the compile-time-embedded file.
+/// Every source — bundled included — must cover the bundled preset floor.
 pub fn load_policy(policy_url: Option<&str>) -> Result<Policy> {
     let url = policy_url
         .map(str::to_string)
         .or_else(|| std::env::var("CYA_POLICY_URL").ok());
-    if let Some(url) = url {
+    let (json, source) = if let Some(url) = url {
         let out = Command::new("curl")
             .args(["-fsSL", &url])
             .output()
             .context("failed to launch curl")?;
         ensure!(out.status.success(), "policy fetch failed: {url}");
-        let json = String::from_utf8(out.stdout).context("policy fetch not utf-8")?;
-        return parse_policy(&json, &url);
-    }
-    parse_policy(POLICY_JSON, "bundled")
+        (String::from_utf8(out.stdout).context("policy fetch not utf-8")?, url)
+    } else {
+        (POLICY_JSON.to_string(), "bundled".to_string())
+    };
+    let policy = parse_policy(&json, &source)?;
+    validate_against_preset(&policy)?;
+    Ok(policy)
 }
 
 // -------------------------------------------------------------- matching
@@ -501,5 +542,59 @@ mod tests {
         for (name, pat) in policy().ruleset_patterns() {
             assert!(Regex::new(&pat).is_ok(), "ruleset pattern {name} invalid: {pat}");
         }
+    }
+
+    fn policy_json() -> serde_json::Value {
+        serde_json::from_str(POLICY_JSON).unwrap()
+    }
+
+    #[test]
+    fn preset_floor_allows_additions_rejects_removals() {
+        // The bundled file is its own superset.
+        validate_against_preset(&policy()).unwrap();
+
+        // An extra agent is fine.
+        let mut added = policy_json();
+        added["agents"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "new-agent", "names": ["New Agent"], "addresses": [], "verify": "x"
+        }));
+        let p = parse_policy(&added.to_string(), "t").unwrap();
+        validate_against_preset(&p).unwrap();
+
+        // Dropping an agent rejects.
+        let mut dropped = policy_json();
+        dropped["agents"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["id"] != "claude");
+        let p = parse_policy(&dropped.to_string(), "t").unwrap();
+        let e = validate_against_preset(&p).unwrap_err().to_string();
+        assert!(e.contains("claude"), "{e}");
+
+        // Dropping a single address rejects too.
+        let mut trimmed = policy_json();
+        let claude = trimmed["agents"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a["id"] == "claude")
+            .unwrap();
+        claude["addresses"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a != "noreply@anthropic.com");
+        let p = parse_policy(&trimmed.to_string(), "t").unwrap();
+        let e = validate_against_preset(&p).unwrap_err().to_string();
+        assert!(e.contains("noreply@anthropic.com"), "{e}");
+
+        // Dropping a trailer key rejects.
+        let mut keyed = policy_json();
+        keyed["trailerKeys"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|k| k != "Co-authored-by");
+        let p = parse_policy(&keyed.to_string(), "t").unwrap();
+        let e = validate_against_preset(&p).unwrap_err().to_string();
+        assert!(e.contains("co-authored-by"), "{e}");
     }
 }
