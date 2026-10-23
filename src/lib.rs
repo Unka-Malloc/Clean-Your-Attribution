@@ -586,7 +586,7 @@ impl Policy {
         // separator. UCD White_Space minus U+000A:
         // 0009 000B-000D 0020 0085 00A0 1680 2000-200A 2028 2029 202F 205F 3000
         // Escapes use \x{NNNN}: RE2 rejects the fixed-width \uNNNN form.
-        let nonblank = "[^\\x09\\x0B-\\x0D\\x20\\x85\\xA0\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]";
+        let nonblank = "[^\\x09-\\x0D\\x20\\x85\\xA0\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]";
         let after_subject = format!("{nonblank}[\\s\\S]*?\\n");
         let canonical_alt = self
             .trailer_keys
@@ -1020,6 +1020,7 @@ mod tests {
             "Reviewed-by: Claude Code\n",
             "\nReviewed-by: Claude Code\n",
             "\u{a0}\nReviewed-by: Claude Code\n",
+            "\n\n\nReviewed-by: Codex\n",
             "fix: t\n\n  🤖 Generated with [Claude Code](https://claude.ai/code)\n",
             "fix: t\r\n\r\nReviewed-by: Copilot was discussed\r\n",
         ] {
