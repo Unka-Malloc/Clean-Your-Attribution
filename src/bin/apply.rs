@@ -1,5 +1,5 @@
 //! ag-apply — fleet rollout for attribution-gate: install the check
-//! workflow, two repo rulesets, and squash-only merge settings on every
+//! workflow, three repo rulesets, and squash-only merge settings on every
 //! targeted repository.
 //!
 //!   ag-apply --orgs ORG1,ORG2 --users OWNER \
@@ -224,6 +224,31 @@ fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -
     })
 }
 
+/// Tags cannot carry commit-metadata rules (branch-scoped in GitHub's
+/// ruleset model) and a tag push would execute whatever workflow definition
+/// the tagged commit carries — so the scan workflow never runs on tags and
+/// tag writes are instead restricted to repository administrators. Tagging
+/// an unscanned commit then requires the same actor who could push to the
+/// default branch directly.
+fn ruleset_tags(enforcement: &str) -> Value {
+    json!({
+        "name": "attribution-gate-tags",
+        "target": "tag",
+        "enforcement": enforcement,
+        "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
+        "rules": [
+            { "type": "creation" },
+            { "type": "update" },
+            { "type": "deletion" },
+        ],
+        "bypass_actors": [{
+            "actor_id": 5,
+            "actor_type": "RepositoryRole",
+            "bypass_mode": "always",
+        }],
+    })
+}
+
 fn ruleset_default_branch(enforcement: &str) -> Value {
     json!({
         "name": "attribution-gate-default",
@@ -413,6 +438,7 @@ fn main() -> Result<()> {
                 &ruleset_deny_trailers(&args.enforcement, &policy),
                 args.dry_run,
             )?;
+            ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
             ensure_ruleset(
                 owner,
                 repo,

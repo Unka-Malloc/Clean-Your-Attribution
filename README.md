@@ -15,8 +15,8 @@ tested; the rollout tool builds, but the fleet has not been applied yet.
 | Surface | What it does | Where it runs |
 | --- | --- | --- |
 | `cya` binary | scans or rewrites commit messages, stripping denied trailers; installs repo hooks | any machine — yours or a collaborator's, a single static binary |
-| `sig-check.yml` workflow | scans the PR/merge-group commit range, tag and default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
-| `ag-apply` binary | installs the workflow, two rulesets, and squash-only merge settings in every targeted repo | run by an operator locally |
+| `sig-check.yml` workflow | scans the PR/merge-group commit range, default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
+| `ag-apply` binary | installs the workflow, three rulesets, and squash-only merge settings in every targeted repo | run by an operator locally |
 
 All three resolve from the same source of truth: `policy/trailers.json`,
 which is compiled into the binaries at build time.
@@ -51,6 +51,12 @@ whose commit messages match the deny pattern and require the workflow's
 `attribution scan` check on the default branch. Merges are squash-only with
 the PR title as the sole commit-message source, so trailers in a dirty
 branch cannot reach the default branch's history.
+
+Tags are enforced differently: a tag push would run whatever workflow the
+tagged commit carries, and commit-metadata rules are branch-scoped — so
+the scan never runs on `refs/tags/*` and a third ruleset,
+`attribution-gate-tags`, restricts tag creation, update and deletion to
+repository administrators.
 
 The workflow provisions the `cya` binary from this repository's release
 assets for the runner's OS/arch, falling back to `cargo install --git`

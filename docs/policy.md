@@ -100,6 +100,17 @@ match a noncanonical key:
 The address-field rules need no position argument — author/committer is
 always an identity position.
 
+## Tag enforcement
+
+Commit-metadata rules (`commit_message_pattern`, the two address rules)
+are branch-scoped in GitHub's ruleset model, and a tag push would execute
+whatever workflow the tagged commit carries — so `sig-check.yml` never
+runs on `refs/tags/*`. `ag-apply` instead installs
+`attribution-gate-tags`, a tag-targeted ruleset that restricts tag
+creation, update and deletion to repository administrators. Pointing a
+tag at an unscanned commit then requires the same actor who could push
+to the default branch directly.
+
 ## Resolution order
 
 1. `--policy-url URL` / `CYA_POLICY_URL` (remote override — lets a fleet update rules without reinstalling),
