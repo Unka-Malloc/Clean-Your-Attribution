@@ -1,0 +1,34 @@
+# Dependencies / interpreter state
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+target/
+.dart_tool/
+
+# Build output / temporary reports / plans
+build/
+build-*/
+dist/
+out/
+coverage/
+.cache/
+*.log
+*.tmp
+docs/plans/
+docs/reports/
+tmp/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo

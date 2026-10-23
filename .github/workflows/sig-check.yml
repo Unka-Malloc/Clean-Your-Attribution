@@ -1,0 +1,77 @@
+name: attribution-gate
+
+# Dual-entry check workflow:
+# - pull_request / merge_group / push: can be referenced directly by a repo
+#   ruleset "Require workflows to pass" rule — no per-repo caller needed.
+# - workflow_call: can be reused by a thin caller file in repositories where
+#   ruleset workflow references are unavailable.
+# The cya binary is provisioned from this repository's latest release asset
+# for the runner's OS/arch, falling back to `cargo install --git` until a
+# release exists. The policy travels inside the binary.
+
+on:
+  workflow_call:
+  pull_request:
+  merge_group:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: attribution scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve scan range
+        id: range
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request)
+              echo "range=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+              ;;
+            merge_group)
+              echo "range=${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+              ;;
+            push)
+              echo "range=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "range=HEAD" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Provision cya
+        run: |
+          set -e
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          asset="cya-${os}-${arch}"
+          base="https://github.com/${{ github.repository_owner }}/attribution-gate"
+          for origin in "$base" "https://github.com/Unka-Malloc/attribution-gate"; do
+            if curl -fsSL "$origin/releases/latest/download/$asset" -o "$RUNNER_TEMP/cya"; then
+              chmod +x "$RUNNER_TEMP/cya"
+              break
+            fi
+            origin=""
+          done
+          if [ -z "$origin" ]; then
+            # No release asset yet — build from source. Runners ship Rust.
+            cargo install --git https://github.com/Unka-Malloc/attribution-gate \
+              --locked --root "$RUNNER_TEMP/cya-home" --bin cya
+            ln -sf "$RUNNER_TEMP/cya-home/bin/cya" "$RUNNER_TEMP/cya"
+          fi
+          "$RUNNER_TEMP/cya" policy --check
+
+      - name: Scan commit range
+        run: "$RUNNER_TEMP/cya" scan --range "${{ steps.range.outputs.range }}"
+
+      - name: Scan pull request title and body
+        if: github.event_name == 'pull_request'
+        run: |
+          printf '%s\n%s\n' "${{ github.event.pull_request.title }}" "${{ github.event.pull_request.body }}" \
+            | "$RUNNER_TEMP/cya" scan --stdin

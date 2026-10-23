@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "denyTrailerKeys": [
+    "Co-authored-by",
+    "Generated-by",
+    "Assisted-by"
+  ],
+  "denyMessagePatterns": [
+    {
+      "id": "generated-with-footer",
+      "flags": "im",
+      "pattern": "^\\s*.{0,8}generated with\\b.*$",
+      "note": "Footer lines like \"🤖 Generated with <tool>\" that carry no trailer key."
+    }
+  ],
+  "rulesetPattern": "(?m)^(Co-authored-by|Generated-by|Assisted-by):",
+  "rulesetNote": "RE2 regex used verbatim in GitHub ruleset metadata restrictions; keep in sync with denyTrailerKeys."
+}
