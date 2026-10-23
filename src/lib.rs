@@ -560,9 +560,12 @@ impl Policy {
         // Server-side rules are a deliberately SAFE SUBSET of the local
         // classifier. Two structural constraints shape them:
         //   - the local noncanonical gate exempts the subject — the first
-        //     NON-EMPTY line. A `*-by` rule therefore requires a `\S`
-        //     before the key's line (`\S[\s\S]*?\n`): a key on the first
-        //     non-empty line can never match, whatever blank lines lead.
+        //     NON-EMPTY line, where "empty" is Rust trim() = Unicode
+        //     White_Space. A `*-by` rule therefore requires a non-blank
+        //     line before the key's line: `nonblank` is the negated
+        //     White_Space set minus \n (RE2's \S is ASCII-only and would
+        //     treat NBSP & co as content — the explicit class keeps the
+        //     subject boundary identical on both engines).
         //   - `Key:` rules only cover keys ending in `-by` — every real
         //     attribution key (Co-authored-by, Signed-off-by, Reviewed-by,
         //     …) has that shape, while conventional-commit subjects and
@@ -579,7 +582,11 @@ impl Policy {
         // prose values remain CLI-detected only — a documented
         // server-side gap, never a false rejection.
         let by_key = "[A-Za-z][A-Za-z0-9-]*-by";
-        let after_subject = "\\S[\\s\\S]*?\\n";
+        // Non-blank char = outside Unicode White_Space and not the line
+        // separator. UCD White_Space minus U+000A:
+        // 0009 000B-000D 0020 0085 00A0 1680 2000-200A 2028 2029 202F 205F 3000
+        let nonblank = "[^\\x09\\x0B-\\x0D\\x20\\x85\\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]";
+        let after_subject = format!("{nonblank}[\\s\\S]*?\\n");
         let canonical_alt = self
             .trailer_keys
             .iter()
@@ -949,6 +956,28 @@ mod tests {
     /// message they deny is denied locally, and the classifier's preserved
     /// cases (prose, subjects, placeholders, humans) are never rejected.
     /// Exotic non-`-by` trailer keys stay a documented server-side gap.
+    /// The `\S` shorthand is banned from generated patterns: RE2's `\s` is
+    /// ASCII-only while the classifier's blank test is Unicode-aware —
+    /// divergence there silently widens the server side.
+    #[test]
+    fn ruleset_patterns_avoid_ascii_shorthand() {
+        for r in policy().ruleset_patterns() {
+            // Safe idioms: `[^\S\n]` (whitespace minus newline — RE2's ASCII
+            // set only shrinks matches) and `[\s\S]` (the class unioned with
+            // its own complement — every char under either semantics).
+            let without_negated = r
+                .pattern
+                .replace("[^\\S\\n]", "")
+                .replace("[\\s\\S]", "");
+            assert!(
+                !without_negated.contains("\\S"),
+                "ruleset rule {} uses \\S — RE2 ASCII semantics diverge: {}",
+                r.name,
+                r.pattern
+            );
+        }
+    }
+
     #[test]
     fn ruleset_patterns_match_classifier_verdicts() {
         let p = policy();
@@ -990,6 +1019,7 @@ mod tests {
             "fix: t\n\nReviewed-by: Copilot was discussed\n",
             "Reviewed-by: Claude Code\n",
             "\nReviewed-by: Claude Code\n",
+            "\u{a0}\nReviewed-by: Claude Code\n",
             "fix: t\n\n  🤖 Generated with [Claude Code](https://claude.ai/code)\n",
             "fix: t\r\n\r\nReviewed-by: Copilot was discussed\r\n",
         ] {
