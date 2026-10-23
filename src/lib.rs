@@ -582,9 +582,10 @@ impl Policy {
         // prose values remain CLI-detected only — a documented
         // server-side gap, never a false rejection.
         let by_key = "[A-Za-z][A-Za-z0-9-]*-by";
-        // Non-blank char = outside Unicode White_Space and not the line
-        // separator. UCD White_Space minus U+000A:
-        // 0009 000B-000D 0020 0085 00A0 1680 2000-200A 2028 2029 202F 205F 3000
+        // Non-blank char = outside Unicode White_Space; the line separator
+        // itself must also not qualify (an embedded \n in the stream is not
+        // content). Excluded set: 0009-000D 0020 0085 00A0 1680 2000-200A
+        // 2028 2029 202F 205F 3000 — White_Space plus U+000A.
         // Escapes use \x{NNNN}: RE2 rejects the fixed-width \uNNNN form.
         let nonblank = "[^\\x09-\\x0D\\x20\\x85\\xA0\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]";
         let after_subject = format!("{nonblank}[\\s\\S]*?\\n");
