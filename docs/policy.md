@@ -111,6 +111,13 @@ creation, update and deletion to repository administrators. Pointing a
 tag at an unscanned commit then requires the same actor who could push
 to the default branch directly.
 
+The tag ruleset is fail-closed by construction: it is installed before
+the workflow update so a failed rollout never leaves tags both
+unrestricted and unscanned, and it always deploys `active` — the
+`--enforcement evaluate` staging mode softens the branch rulesets but
+must not silently reopen tag writes (only an explicit `disabled` turns
+it off).
+
 ## Resolution order
 
 1. `--policy-url URL` / `CYA_POLICY_URL` (remote override — lets a fleet update rules without reinstalling),

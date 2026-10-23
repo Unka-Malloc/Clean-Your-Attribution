@@ -56,7 +56,9 @@ Tags are enforced differently: a tag push would run whatever workflow the
 tagged commit carries, and commit-metadata rules are branch-scoped — so
 the scan never runs on `refs/tags/*` and a third ruleset,
 `attribution-gate-tags`, restricts tag creation, update and deletion to
-repository administrators.
+repository administrators. That restriction always deploys `active` —
+an `--enforcement evaluate` staging run must not silently reopen tag
+writes while the workflow skips them; only `disabled` turns it off.
 
 The workflow provisions the `cya` binary from this repository's release
 assets for the runner's OS/arch, falling back to `cargo install --git`

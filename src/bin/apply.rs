@@ -230,11 +230,21 @@ fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -
 /// tag writes are instead restricted to repository administrators. Tagging
 /// an unscanned commit then requires the same actor who could push to the
 /// default branch directly.
+///
+/// The restriction is fail-closed: `evaluate` stages the other rulesets
+/// report-only, but here it would silently leave tag writes open while the
+/// workflow skips tag scans — so `evaluate` maps to `active`. An explicit
+/// `disabled` is honored as an operator choice.
 fn ruleset_tags(enforcement: &str) -> Value {
+    let tag_enforcement = if enforcement == "disabled" {
+        "disabled"
+    } else {
+        "active"
+    };
     json!({
         "name": "attribution-gate-tags",
         "target": "tag",
-        "enforcement": enforcement,
+        "enforcement": tag_enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
         "rules": [
             { "type": "creation" },
@@ -431,6 +441,10 @@ fn main() -> Result<()> {
         }
         println!("  {full}:");
         let run = || -> Result<()> {
+            // Tag protection lands before the workflow update: if the ruleset
+            // call fails, the still-deployed older workflow keeps scanning
+            // tag pushes instead of leaving them both unprotected.
+            ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
             ensure_workflow(owner, repo, workflow_content, args.dry_run)?;
             ensure_ruleset(
                 owner,
@@ -438,7 +452,6 @@ fn main() -> Result<()> {
                 &ruleset_deny_trailers(&args.enforcement, &policy),
                 args.dry_run,
             )?;
-            ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
             ensure_ruleset(
                 owner,
                 repo,
