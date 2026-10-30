@@ -625,7 +625,7 @@ Policy: --policy-url URL or CYA_POLICY_URL, else the compiled-in policy.
 fn main() {
     let argv: Vec<String> = env::args().skip(1).collect();
     let command = argv.first().map(String::as_str).unwrap_or("");
-    let rest = &argv[1..];
+    let rest = argv.get(1..).unwrap_or(&[]);
     let code = if command == "hook" {
         cmd_hook(rest)
     } else if command == "agents" {
