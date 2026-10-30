@@ -1,10 +1,12 @@
 //! cya — clean your attribution. Local enforcement surface of
-//! attribution-gate: scan, strip, rewrite ranges, or install hooks so
-//! denied attribution never forms. The server-side surface is
+//! clean-your-attribution: scan, strip, rewrite ranges, install hooks so
+//! denied attribution never forms, and switch local agents' own
+//! attribution options off. The server-side surface is
 //! `.github/workflows/sig-check.yml`.
 
 use anyhow::{Context, Result};
-use attribution_gate::{
+use clean_your_attribution::agents;
+use clean_your_attribution::{
     identity_agent, load_policy, message_findings, strip_denied, Findings, IdentityHit, Policy,
 };
 use std::env;
@@ -15,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-const HOOK_MARKER: &str = "# attribution-gate";
+const HOOK_MARKER: &str = "# clean-your-attribution";
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
 fn git(args: &[&str]) -> Result<String> {
@@ -468,6 +470,133 @@ fn cmd_policy(argv: &[String], policy: &Policy) -> Result<i32> {
     Ok(0)
 }
 
+// ------------------------------------------------------------ agents --
+
+fn tilde(path: &std::path::Path) -> String {
+    match agents::home_dir() {
+        Ok(h) if path.starts_with(&h) => format!("~/{}", path.strip_prefix(&h).unwrap().display()),
+        _ => path.display().to_string(),
+    }
+}
+
+fn print_probe(knob_label: &str, p: &agents::Probe, home: &std::path::Path) {
+    let file = tilde(&home.join(p.rel));
+    let state = match &p.state {
+        agents::State::Off => "off".into(),
+        agents::State::On(v) => format!("on ({knob_label} = {v})"),
+        agents::State::Absent if !p.primary => "absent — inherits".into(),
+        agents::State::Absent => "unset — agent default applies".into(),
+        agents::State::NoFile if !p.primary => "absent".into(),
+        agents::State::NoFile => "missing — would create".into(),
+        agents::State::Unparseable => "UNREADABLE — skipped".into(),
+    };
+    if matches!(p.state, agents::State::NoFile) && !p.primary {
+        return; // precedence clones that do not exist are not noise
+    }
+    println!("    {file}  {knob_label}: {state}");
+}
+
+fn cmd_agents(argv: &[String]) -> Result<i32> {
+    let home = agents::home_dir()?;
+    let off = argv.iter().any(|a| a == "off");
+    let id = argv
+        .iter()
+        .find(|a| a.as_str() != "agents" && a.as_str() != "off" && !a.starts_with('-'));
+    let target: Vec<&'static agents::Agent> = match (off, id) {
+        (_, Some(id)) => match agents::find(id) {
+            Some(a) => vec![a],
+            None => {
+                let known: Vec<_> = agents::AGENTS.iter().map(|a| a.id).collect();
+                anyhow::bail!("unknown agent {id:?} — known: {}", known.join(", "));
+            }
+        },
+        _ => agents::AGENTS.iter().collect(),
+    };
+    let mut code = 0;
+    for agent in target {
+        if !off {
+            let r = agents::scan(&home, agent);
+            if !r.installed {
+                if id.is_some() {
+                    println!("{}  {}  — not installed", agent.id, agent.display);
+                }
+                continue;
+            }
+            if agent.knobs.is_empty() {
+                println!(
+                    "{}  {}  — no local attribution switch (server-side bots are denied by the policy surfaces)",
+                    agent.id, agent.display
+                );
+                continue;
+            }
+            let state = if r.is_off() {
+                "off"
+            } else {
+                code = 1;
+                "ON"
+            };
+            println!("{}  {}  {state}", agent.id, agent.display);
+            for (label, p) in &r.probes {
+                print_probe(label, p, &home);
+            }
+            continue;
+        }
+        if agent.knobs.is_empty() {
+            if !agents::scan(&home, agent).installed {
+                continue;
+            }
+            println!(
+                "{}  {}  — no local switch, nothing to write",
+                agent.id, agent.display
+            );
+            continue;
+        }
+        let results = agents::apply(&home, agent)?;
+        let mut changed = 0usize;
+        let mut unreadable = Vec::new();
+        for (label, file, applied) in &results {
+            match applied {
+                agents::Applied::Written(true) => {
+                    changed += 1;
+                    println!("    {}  {label} → off", tilde(file));
+                }
+                agents::Applied::Written(false) | agents::Applied::Absent => {}
+                agents::Applied::Unparseable => {
+                    unreadable.push(format!("{label} in {}", tilde(file)))
+                }
+            }
+        }
+        for s in &unreadable {
+            eprintln!("    skipped {s}");
+        }
+        if !unreadable.is_empty() {
+            code = 1;
+        }
+        println!(
+            "{}  {}  — {} change(s){}",
+            agent.id,
+            agent.display,
+            changed,
+            if unreadable.is_empty() {
+                ""
+            } else {
+                ", see skips"
+            }
+        );
+    }
+    if off {
+        println!(
+            "{}",
+            if code == 0 {
+                "cya: agent attribution off everywhere it has a switch"
+            } else {
+                "cya: done with skips — unreadable files need a manual pass"
+            }
+        );
+    }
+    Ok(code)
+}
+
 // --------------------------------------------------------------- args --
 
 fn has_flag(argv: &[String], name: &str) -> bool {
@@ -488,6 +617,7 @@ const USAGE: &str = "cya — clean your attribution
   cya clean [--range A..B]                       rewrite the range, stripping trailers
   cya hook [--dir DIR] [--force]                 install commit-msg + pre-push hooks
   cya policy [--check]                           print / verify effective policy
+  cya agents [off [ID]]                          agent attribution switches: report, or off all / one
 
 Policy: --policy-url URL or CYA_POLICY_URL, else the compiled-in policy.
 ";
@@ -498,6 +628,8 @@ fn main() {
     let rest = &argv[1..];
     let code = if command == "hook" {
         cmd_hook(rest)
+    } else if command == "agents" {
+        cmd_agents(&argv)
     } else {
         match load_policy(flag_value(&argv, "--policy-url").as_deref()) {
             Ok(policy) => match command {

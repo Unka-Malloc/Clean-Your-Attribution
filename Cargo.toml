@@ -1,11 +1,13 @@
 [package]
-name = "attribution-gate"
+name = "clean-your-attribution"
 version = "0.1.0"
 edition = "2021"
-description = "One attribution policy, three enforcement surfaces: local commit cleaning, server-side push/PR denial, and fleet rollout."
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Clean-Your-Attribution"
+description = "One attribution policy, three enforcement surfaces plus a local agent switch: commit cleaning, server-side push/PR denial, fleet rollout, and turning off agents' own attribution options."
 
 [lib]
-name = "attribution_gate"
+name = "clean_your_attribution"
 path = "src/lib.rs"
 
 [[bin]]
@@ -13,12 +15,12 @@ name = "cya"
 path = "src/main.rs"
 
 [[bin]]
-name = "ag-apply"
-path = "src/bin/apply.rs"
+name = "cya-apply"
+path = "src/bin/cya-apply.rs"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }

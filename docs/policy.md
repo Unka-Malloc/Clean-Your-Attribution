@@ -105,8 +105,8 @@ always an identity position.
 Commit-metadata rules (`commit_message_pattern`, the two address rules)
 are branch-scoped in GitHub's ruleset model, and a tag push would execute
 whatever workflow the tagged commit carries — so `sig-check.yml` never
-runs on `refs/tags/*`. `ag-apply` instead installs
-`attribution-gate-tags`, a tag-targeted ruleset that restricts tag
+runs on `refs/tags/*`. `cya-apply` instead installs
+`clean-your-attribution-tags`, a tag-targeted ruleset that restricts tag
 creation, update and deletion to repository administrators. Pointing a
 tag at an unscanned commit then requires the same actor who could push
 to the default branch directly.
@@ -117,7 +117,7 @@ rulesets but must not silently reopen tag writes (only an explicit
 `disabled` turns it off). It is also installed before the workflow
 update, so an upgrade rollout that fails there preserves whichever older
 protection was in place; on a first install a failure means nothing was
-deployed, and `ag-apply` reports the repo as not fully protected either
+deployed, and `cya-apply` reports the repo as not fully protected either
 way — a partially enrolled target must be re-applied, never treated as
 covered.
 

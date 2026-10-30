@@ -1,8 +1,8 @@
-//! ag-apply — fleet rollout for attribution-gate: install the check
-//! workflow, three repo rulesets, and squash-only merge settings on every
-//! targeted repository.
+//! cya-apply — fleet rollout for clean-your-attribution: install the
+//! check workflow, three repo rulesets, and squash-only merge settings
+//! on every targeted repository.
 //!
-//!   ag-apply --orgs ORG1,ORG2 --users OWNER \
+//!   cya-apply --orgs ORG1,ORG2 --users OWNER \
 //!     [--enforcement evaluate|active|disabled] [--include-private] \
 //!     [--repos o/r,...] [--dry-run]
 //!
@@ -11,15 +11,15 @@
 //! process; this binary only receives API responses.
 
 use anyhow::{bail, Context, Result};
-use attribution_gate::load_policy;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use clean_your_attribution::load_policy;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::process::Command;
 
-const WORKFLOW_PATH: &str = ".github/workflows/attribution-gate.yml";
-const CHECK_CONTEXT: &str = "attribution-gate / attribution scan";
+const WORKFLOW_PATH: &str = ".github/workflows/clean-your-attribution.yml";
+const CHECK_CONTEXT: &str = "clean-your-attribution / attribution scan";
 const ACTIONS_INTEGRATION_ID: i64 = 15368;
 
 struct Args {
@@ -55,7 +55,7 @@ fn parse_args() -> Result<Args> {
         "--enforcement must be evaluate|active|disabled"
     );
     if argv.is_empty() || argv.iter().any(|a| a == "--help") {
-        bail!("usage: ag-apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--include-private] [--dry-run]");
+        bail!("usage: cya-apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--include-private] [--dry-run]");
     }
     Ok(Args {
         orgs: list("--orgs"),
@@ -198,7 +198,7 @@ fn api_gitvault(method: &str, path: &str, body: Option<&Value>) -> Result<Value>
 
 // ------------------------------------------------------------- payloads --
 
-fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -> Value {
+fn ruleset_deny_trailers(enforcement: &str, policy: &clean_your_attribution::Policy) -> Value {
     let rules: Vec<Value> = policy
         .ruleset_patterns()
         .iter()
@@ -215,7 +215,7 @@ fn ruleset_deny_trailers(enforcement: &str, policy: &attribution_gate::Policy) -
         })
         .collect();
     json!({
-        "name": "attribution-gate",
+        "name": "clean-your-attribution",
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
@@ -242,7 +242,7 @@ fn ruleset_tags(enforcement: &str) -> Value {
         "active"
     };
     json!({
-        "name": "attribution-gate-tags",
+        "name": "clean-your-attribution-tags",
         "target": "tag",
         "enforcement": tag_enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
@@ -261,7 +261,7 @@ fn ruleset_tags(enforcement: &str) -> Value {
 
 fn ruleset_default_branch(enforcement: &str) -> Value {
     json!({
-        "name": "attribution-gate-default",
+        "name": "clean-your-attribution-default",
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
@@ -365,7 +365,7 @@ fn ensure_workflow(owner: &str, repo: &str, workflow_content: &str, dry_run: boo
         return Ok(());
     }
     let mut body = json!({
-        "message": "chore(attribution): install attribution-gate check workflow",
+        "message": "chore(attribution): install clean-your-attribution check workflow",
         "content": B64.encode(workflow_content),
     });
     if let Some(sha) = existing.and_then(|v| v.get("sha").and_then(Value::as_str).map(String::from))
@@ -477,7 +477,7 @@ fn main() -> Result<()> {
             println!("    FAILED: {e:#}");
             println!(
                 "    repo NOT fully protected — an interrupted rollout can leave it \
-                 partly enrolled; rerun ag-apply before treating it as covered"
+                 partly enrolled; rerun cya-apply before treating it as covered"
             );
         }
     }

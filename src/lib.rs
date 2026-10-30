@@ -13,6 +13,8 @@ use serde::Deserialize;
 use std::process::Command;
 use std::sync::LazyLock;
 
+pub mod agents;
+
 /// Canonical policy embedded from `policy/trailers.json` — file and binary
 /// cannot drift apart because there is one source of bytes.
 const POLICY_JSON: &str = include_str!("../policy/trailers.json");

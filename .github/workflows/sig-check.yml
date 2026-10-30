@@ -1,4 +1,4 @@
-name: attribution-gate
+name: clean-your-attribution
 
 # Dual-entry check workflow:
 # - pull_request / merge_group / push: can be referenced directly by a repo
@@ -74,8 +74,8 @@ jobs:
           os="$(uname -s | tr '[:upper:]' '[:lower:]')"
           arch="$(uname -m)"
           asset="cya-${os}-${arch}"
-          base="https://github.com/${{ github.repository_owner }}/attribution-gate"
-          for origin in "$base" "https://github.com/Unka-Malloc/attribution-gate"; do
+          base="https://github.com/${{ github.repository_owner }}/clean-your-attribution"
+          for origin in "$base" "https://github.com/Unka-Malloc/Clean-Your-Attribution"; do
             if curl -fsSL "$origin/releases/latest/download/$asset" -o "$RUNNER_TEMP/cya"; then
               chmod +x "$RUNNER_TEMP/cya"
               break
@@ -84,7 +84,7 @@ jobs:
           done
           if [ -z "$origin" ]; then
             # No release asset yet — build from source. Runners ship Rust.
-            cargo install --git https://github.com/Unka-Malloc/attribution-gate \
+            cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
               --locked --root "$RUNNER_TEMP/cya-home" --bin cya
             ln -sf "$RUNNER_TEMP/cya-home/bin/cya" "$RUNNER_TEMP/cya"
           fi

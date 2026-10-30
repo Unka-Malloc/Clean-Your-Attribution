@@ -29,9 +29,9 @@ Known cost trade-offs, all deliberate:
   a `cya` binary; after that the workflow downloads the asset and the
   ~80 s build disappears.
 
-## Local CLI (`cya`, `ag-apply`)
+## Local CLI (`cya`, `cya-apply`)
 
 Single-shot processes: one `git log` read per scan, linear regex
-matching per commit, no daemons, no polling, no retry loops. `ag-apply`
+matching per commit, no daemons, no polling, no retry loops. `cya-apply`
 pages GitHub list endpoints at 100/page — the minimum request count the
 API allows — and stops on the first empty page.
