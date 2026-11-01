@@ -13,14 +13,18 @@ on:
 
 permissions: {}
 
+# One queue slot per release event: a single shared group would let
+# GitHub replace a still-pending publish with a newer release and drop
+# the earlier upload entirely. Keyed on the immutable release id, a
+# re-run of the same event still serializes while distinct releases
+# never evict one another.
 concurrency:
-  group: publish
+  group: publish-${{ github.event.release.id }}
   cancel-in-progress: false
 
 jobs:
   crates:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     environment: release
     permissions:
       contents: read
@@ -36,12 +40,21 @@ jobs:
           persist-credentials: false
 
       # The `release` environment's protection rules are the operator's
-      # approval gate; an auto-created empty environment would carry no
-      # rules at all, so its absence is refused rather than shipped.
-      - name: Require the release environment
+      # approval gate. Naming the environment is not enough — GitHub
+      # auto-creates a missing environment with no rules at all, so the
+      # job fails closed unless a required-reviewer rule with at least
+      # one reviewer is actually configured.
+      - name: Require release-environment approval
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api "repos/$GITHUB_REPOSITORY/environments/release" --jq .name
+        run: |
+          reviewers=$(gh api "repos/$GITHUB_REPOSITORY/environments/release" \
+            --jq '[.protection_rules[] | select(.type == "required_reviewers")
+                   | (.reviewers // [])[]] | length')
+          test "$reviewers" -gt 0 || {
+            echo "the release environment has no required-reviewer rule" >&2
+            exit 1
+          }
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
@@ -50,6 +63,20 @@ jobs:
       # publishing identity.
       - name: Isolate the cargo home
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The uploaded version is the one the release names: without this
+      # check a stray release.published event would ship whatever
+      # version Cargo.toml happens to carry. Enforced before any
+      # authentication so a mistagged release never reaches the OIDC
+      # exchange — and before the already-published skip, which must
+      # only ever short-circuit the release it belongs to.
+      - name: Bind the release tag to the package version
+        run: |
+          vers=$(sed -n 's/^version = "\(.*\)"/\1/p' "$GITHUB_WORKSPACE/Cargo.toml" | head -1)
+          test "$GITHUB_REF_NAME" = "v$vers" || {
+            echo "release tag $GITHUB_REF_NAME does not match package version v$vers" >&2
+            exit 1
+          }
 
       - name: Authenticate to crates.io
         id: auth

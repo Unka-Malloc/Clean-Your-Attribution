@@ -43,14 +43,31 @@ credentials.
 
 ## Release
 
-Releases are manual: bump `Cargo.toml`, `cargo publish` locally, tag
-`v<version>` and push the tag. Network is the crates.io sparse-index
-check plus one `.crate` upload (≈ 45 KiB compressed, `cargo package`
-measured) and a kilobyte-scale tag push; no runner minutes are spent.
+Releases run through `publish.yml`: bump `Cargo.toml`, tag `v<version>`,
+push the tag, and publish the GitHub release — the `release.published`
+event is the only trigger. One `ubuntu-latest` job then packages the
+crate and uploads it, so a release spends one job's minutes — **zero
+billed minutes** while the repository is public (same billing source as
+above) — plus the crates.io sparse-index probe and one `.crate` upload
+(≈ 45 KiB compressed, `cargo package` measured). The job is queued per
+release (`publish-<release id>`), so distinct pending releases never
+evict one another, and an upload whose version the index already
+carries — a hand-published name claim, a retried run — exits as a green
+skip without re-uploading.
 
-Trust basis, stated plainly: the `.crate` is packaged by `cargo publish`
-from the operator's local checkout under their crates.io credentials —
-there is no build attestation or provenance record beyond the tag
+The job holds no stored credential: it exchanges a GitHub OIDC token for
+a short-lived crates.io token through crates.io Trusted Publishing, and
+that exchange is bound to this workflow file, this repository, and the
+`release` GitHub environment. Deployment under that environment only
+proceeds after its required-reviewer protection approves, and the job
+itself re-verifies the rule exists — a missing or unprotected
+environment fails closed, as does a release tag that does not equal
+`v<Cargo.toml version>` — checked before any authentication runs.
+
+Trust basis, stated plainly: the `.crate` is packaged by a GitHub-hosted
+runner from the tagged commit under an environment-scoped OIDC identity;
+the approval decision and the OIDC token exchange are the provenance
+record, and there is no additional build attestation beyond the tag
 pointing at the same commit. `sig-check.yml` consumers install the
 binary through `cargo install clean-your-attribution@<resolved> --locked`:
 the crates.io sparse index chooses the release at run time (maximum
