@@ -124,7 +124,9 @@ covered.
 ## Branch rollout: two declarations and reconciliation
 
 `cya apply` installs a repo-wide set plus a branch-scoped set, each
-explicitly named — nothing is scoped implicitly:
+explicitly named at install time. Enforcement declared by an earlier
+run persists until `--prune` removes it — a run never silently widens
+or narrows what an operator previously named:
 
 - **Repo-wide** (`--repos`, `--orgs`, `--users`): the `~ALL` deny
   ruleset, the `~ALL`-tags admin restriction, and squash-only merge
@@ -141,24 +143,31 @@ explicitly named — nothing is scoped implicitly:
   `disabled` — not absent — because a live check-scoped ruleset on
   fileless branches would deadlock the very merge meant to carry the
   file back. Once the file lands on a named branch, the next apply run
-  PUTs the ruleset `active` scoped at the branches that produce the
-  check; a named branch still without the file stays out of its scope.
+  PUTs the ruleset in the run's `--enforcement` mode (`evaluate` by
+  default — report-only; `active` only when explicitly requested)
+  scoped at the branches that produce the check; a named branch still
+  without the file stays out of its scope.
 
-Reconciliation is explicit opt-in: a run creates and updates only, and
-every tool-owned ruleset outside the declared set is *warned* about and
-counted — the run footer names the leftover and the exit code reports
-it. With `--prune`, the declared set is the whole story — each stale
-managed ruleset is deleted and the removal printed: a `protected` set
-the operator stopped naming, and the superseded pre-0.2.0
-`clean-your-attribution-default` ruleset. A partial rerun — a policy
-refresh naming no refs — can therefore never silently strip gates it
-did not restate; only `includes_parents=false` repo-owned rulesets are
-ever in scope.
+Reconciliation is tiered by what a run can prove. Two repairs are
+unconditional because they are not declaration questions: the
+superseded pre-0.2.0 `clean-your-attribution-default` ruleset
+duplicates the always-installed deny ruleset and is deleted outright,
+and a `check` ruleset whose every scoped branch lacks the workflow —
+a deadlock, since it demands a check that cannot run — is PUT
+`disabled`. Everything else stale keeps enforcing and is *warned*
+about and counted — the run footer names the leftover and the exit
+code reports it: a `-check` gate a run no longer names while some
+scoped branch still produces the check, or a `protected` set the
+operator stopped naming. With `--prune` those leftovers are deleted
+and each removal printed. A partial rerun — a policy refresh naming
+no refs — can therefore never silently strip gates it did not
+restate; only `includes_parents=false` repo-owned rulesets are ever
+in scope.
 
 Exit codes: `0` the declared state fully landed; `1` one or more repos
-failed; `3` the run succeeded but left stale tool-owned rulesets
-enforcing — rerun with `--prune`. (`2` is the CLI's usage-error status,
-unchanged.)
+failed; `3` the run succeeded but left stale tool-owned rulesets —
+rerun with `--prune`; `2` usage or pre-flight error (bad flags, a
+policy that fails to load, a target listing or auth failure).
 
 ## Resolution order
 

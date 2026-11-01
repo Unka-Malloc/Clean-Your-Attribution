@@ -77,8 +77,11 @@ jobs:
           # tolerated on purpose (`|| true`): an unresolvable index emits
           # an empty version, which is the provisioning step's explicit
           # unreleased/fail-closed path, not a dead run.
-          index="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
-            https://index.crates.io/cl/ea/clean-your-attribution || true)"
+          if ! index="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
+            https://index.crates.io/cl/ea/clean-your-attribution)"; then
+            echo "index fetch failed — resolving an empty version"
+            index=""
+          fi
           ver="$(printf '%s' "$index" | python3 -c '
           import json, re, sys
           versions = []
@@ -102,6 +105,13 @@ jobs:
           ')"
           echo "resolved cya ${ver:-<none — unreleased path>}"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
+          # A consumer fails closed here, before any cache restore or
+          # compile spends runner time: only this repository's own
+          # pre-publication runs may continue to the HEAD build.
+          if [ -z "$ver" ] && [ "${{ github.repository }}" != "Unka-Malloc/Clean-Your-Attribution" ]; then
+            echo "cya version unresolvable — the crates.io index is unreachable or names no usable release; failing closed" >&2
+            exit 1
+          fi
 
       # Keyed on the resolved release: an unresolvable index must not
       # restore a binary cached under a different name.

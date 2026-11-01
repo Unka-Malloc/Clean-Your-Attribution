@@ -8,21 +8,20 @@
 //!     [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] \
 //!     [--prune] [--dry-run]
 //!
-//! The declared set is created and updated only: a run never deletes a
-//! ruleset unless `--prune` is given, under which every tool-owned
-//! ruleset outside the declared set (stale `-protected`/`-check`, the
-//! superseded `-default` name) is deleted and each removal printed.
-//! Without `--prune` the same stale objects are warned about, counted in
-//! the footer, and reported as exit 3 — the run is honest about the
-//! enforcement it left behind. One repair is unconditional rather than
-//! pruned: a `check` ruleset live on branches that cannot produce the
-//! check (named protected branches with no workflow yet) is PUT
-//! `disabled` — leaving it enforcing would deadlock the merge meant to
-//! carry the file back, which is a self-inflicted broken state, not a
-//! declaration question.
+//! Ruleset reconciliation is tiered by what the run can prove. A
+//! stale `-default` name duplicates the always-desired deny ruleset —
+//! provably redundant, removed unconditionally. A `check` ruleset whose
+//! scoped branches can no longer produce the check (named protected
+//! branches with no workflow yet, or a leftover -check whose every
+//! literal branch ref lost the file) is a self-installed deadlock —
+//! PUT `disabled` unconditionally, never deleted without `--prune`.
+//! Everything else stale — a `-protected` gate the operator stopped
+//! naming, a `-check` some branch still produces — keeps enforcing,
+//! is warned about and counted, and is deleted only under `--prune`,
+//! so a partial rerun can never silently strip gates it did not restate.
 //!
-//! Exit: 0 declared state landed; 1 repo failure(s); 3 stale rulesets
-//! left enforcing (rerun with --prune).
+//! Exit: 0 declared state landed; 1 repo failure(s); 3 stale tool-owned
+//! rulesets left (rerun with --prune); 2 usage/pre-flight error.
 //!
 //! The tool never opens branches or pull requests and never guesses where
 //! anything belongs: `--install-refs` names (repo, branch) pairs that get
@@ -660,6 +659,37 @@ fn repo_owned(row: &Value) -> bool {
 /// no refs) can never silently strip gates it did not restate.
 /// Without `--prune` each stale ruleset is warned about and counted —
 /// the run's footer and exit code say enforcement was left behind.
+/// Whether a live `-check` ruleset can still produce the check it
+/// demands: reads its detail and asks each literal `refs/heads/<b>` in
+/// its include list for the workflow file. Only a ruleset whose every
+/// scoped branch lacks the file is a proven deadlock — symbolic
+/// patterns, an empty scope or an unreadable detail are not provable
+/// and leave it to the declared-set paths instead.
+fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Result<bool> {
+    let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None)?;
+    let includes = detail
+        .get("conditions")
+        .and_then(|c| c.get("ref_name"))
+        .and_then(|r| r.get("include"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut saw_literal = false;
+    for pattern in &includes {
+        let Some(text) = pattern.as_str() else {
+            return Ok(false);
+        };
+        let Some(branch) = text.strip_prefix("refs/heads/") else {
+            return Ok(false);
+        };
+        saw_literal = true;
+        if workflow_file(owner, repo, Some(branch))?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(saw_literal)
+}
+
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
@@ -671,6 +701,36 @@ fn reconcile_rulesets(
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
     for (name, id) in stale_rulesets(list, desired) {
+        // The superseded `-default` name duplicates the always-desired
+        // deny ruleset — provably redundant, so removal needs no opt-in.
+        if name == RS_LEGACY_DEFAULT {
+            if dry_run {
+                println!("    ruleset {name}: would remove (superseded by {RS_DENY})");
+            } else {
+                api("DELETE", &format!("{base}/{id}"), None)?;
+                println!("    ruleset {name}: removed (superseded by {RS_DENY})");
+            }
+            continue;
+        }
+        // A `-check` no scoped branch can still satisfy is a self-
+        // installed deadlock, not enforcement — disarm it to `disabled`
+        // unconditionally. Deleting it still needs --prune, and a
+        // `-check` some branch still produces is merely stale: warned
+        // about, counted, and only removable under --prune.
+        if name == RS_CHECK && !prune && check_ruleset_deadlocks(owner, repo, id)? {
+            if dry_run {
+                println!(
+                    "    ruleset {name}: would disable (no scoped branch can produce the check)"
+                );
+            } else {
+                let mut body = api("GET", &format!("{base}/{id}"), None)?;
+                body["enforcement"] = json!("disabled");
+                api("PUT", &format!("{base}/{id}"), Some(&body))?;
+                println!("    ruleset {name}: disabled — no scoped branch carries the workflow (deadlock repaired; rerun with --prune to remove)");
+            }
+            left += 1;
+            continue;
+        }
         if !prune {
             left += 1;
             println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
