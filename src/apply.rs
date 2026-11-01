@@ -12,15 +12,15 @@
 //! stale `-default` name duplicates the always-desired deny ruleset —
 //! removed under `--prune`, or without it only while this run installs
 //! an `active` deny successor, so a report-only rerun can never strip
-//! a live gate. A `check` ruleset whose scoped branches can no longer
-//! produce the check (named protected branches with no workflow yet,
-//! or a leftover `-check` whose every literal branch ref lost the
-//! file) is a self-installed deadlock — PUT `disabled` unconditionally,
-//! never deleted without `--prune`. Everything else stale — a
-//! `-protected` gate the operator stopped naming, a `-check` some
-//! branch still produces — keeps enforcing, is warned about and
-//! counted, and is deleted only under `--prune`, so a partial rerun
-//! can never silently strip gates it did not restate.
+//! a live gate. A stale gate that can provably never fire — a `check`
+//! ruleset whose scoped branches all lost the workflow (a deadlock),
+//! or a `-protected` whose scoped branches no longer exist — is PUT
+//! `disabled` unconditionally, never deleted without `--prune`.
+//! Everything else stale — a `-protected` gate the operator stopped
+//! naming, a `-check` some branch still produces — keeps enforcing,
+//! is warned about and counted, and is deleted only under `--prune`,
+//! so a partial rerun can never silently strip gates it did not
+//! restate.
 //!
 //! Exit: 0 declared state landed; 1 repo failure(s); 3 stale tool-owned
 //! rulesets left (rerun with --prune); 2 usage/pre-flight error.
@@ -672,12 +672,12 @@ fn repo_owned(row: &Value) -> bool {
     row.get("source_type").and_then(Value::as_str) == Some("Repository")
 }
 
-/// The literal branch refs a `-check` ruleset detail declares in its
-/// include list. `None` when the scope is not provable from the payload
-/// alone — a symbolic pattern (`~ALL`, `~DEFAULT_BRANCH`), an empty
-/// include list, or a missing conditions block — so only an
-/// all-literal scope can ever be judged a deadlock.
-fn deadlock_branches(detail: &Value) -> Option<Vec<String>> {
+/// The literal branch refs a branch-scoped ruleset detail declares in
+/// its include list. `None` when the scope is not provable from the
+/// payload alone — a symbolic pattern (`~ALL`, `~DEFAULT_BRANCH`), an
+/// empty include list, or a missing conditions block — so only an
+/// all-literal scope can ever be judged dead.
+fn literal_branches(detail: &Value) -> Option<Vec<String>> {
     let includes = detail
         .get("conditions")?
         .get("ref_name")?
@@ -703,15 +703,17 @@ enum StaleAction {
     /// enforcing (`active`) deny successor — otherwise removal would
     /// swap a live gate for a report-only duplicate.
     Remove,
-    /// A `-check` whose scope provably cannot produce the check is a
-    /// deadlock, not enforcement — PUT it `disabled` without waiting
-    /// for `--prune` (deletion still needs the opt-in).
+    /// A stale gate that can provably never fire — a `-check` whose
+    /// scoped branches lost the workflow everywhere, or a `-protected`
+    /// whose scoped branches no longer exist — is disarmed to
+    /// `disabled` without waiting for `--prune` (deletion still needs
+    /// the opt-in). Disarming a dead gate weakens nothing real.
     Disable,
     /// Everything else keeps enforcing: warned, counted, exit 3.
     Warn,
 }
 
-fn stale_action(name: &str, prune: bool, deny_enforcing: bool, deadlocked: bool) -> StaleAction {
+fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bool) -> StaleAction {
     if name == RS_LEGACY_DEFAULT {
         return if prune || deny_enforcing {
             StaleAction::Remove
@@ -719,7 +721,7 @@ fn stale_action(name: &str, prune: bool, deny_enforcing: bool, deadlocked: bool)
             StaleAction::Warn
         };
     }
-    if name == RS_CHECK && !prune && deadlocked {
+    if matches!(name, n if n == RS_CHECK || n == RS_PROTECTED) && !prune && provably_dead {
         return StaleAction::Disable;
     }
     if prune {
@@ -737,7 +739,7 @@ fn stale_action(name: &str, prune: bool, deny_enforcing: bool, deadlocked: bool)
 /// repo failure.
 fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Option<Vec<String>> {
     let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None).ok()?;
-    let branches = deadlock_branches(&detail)?;
+    let branches = literal_branches(&detail)?;
     for branch in &branches {
         match workflow_file(owner, repo, Some(branch)) {
             Ok(Some(_)) => return None,
@@ -748,14 +750,43 @@ fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Option<Vec<Strin
     Some(branches)
 }
 
+/// Probes whether a live `-protected` ruleset is a dead gate: its scope
+/// is all-literal and none of the scoped branches exists any more. A
+/// gate that can never fire is disarmed like a deadlocked `-check`;
+/// `None` covers anything not provable, read failures included.
+fn protected_ruleset_dead(owner: &str, repo: &str, id: i64) -> Option<Vec<String>> {
+    let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None).ok()?;
+    let branches = literal_branches(&detail)?;
+    for branch in &branches {
+        match api(
+            "GET",
+            &format!("/repos/{owner}/{repo}/git/ref/heads/{}", urlencode(branch)),
+            None,
+        ) {
+            Ok(_) => return None,
+            Err(e) => {
+                // 404 means the branch is gone; any other failure is
+                // not provable — a transient error must not disarm a
+                // live gate.
+                let msg = format!("{e:#}");
+                if !msg.contains("Not Found") && !msg.contains("404") {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(branches)
+}
+
 /// Reconciles a repo's ruleset listing against the declared set, tiered
 /// by what the run can prove: a `-default` ruleset is removed only when
 /// it is provably redundant (`--prune`, or an `active` deny successor
-/// this run installs); a `-check` whose scope provably cannot produce
-/// the check is disarmed to `disabled`; every other stale object keeps
-/// enforcing and is only deleted under `--prune`. Returns how many
-/// undeclared objects are left installed — warned or disarmed — for the
-/// footer and exit code.
+/// this run installs); a stale gate that can never fire — a `-check`
+/// whose scoped branches all lost the workflow, or a `-protected` whose
+/// scoped branches no longer exist — is disarmed to `disabled`; every
+/// other stale object keeps enforcing and is only deleted under
+/// `--prune`. Returns how many undeclared objects are left installed —
+/// warned or disarmed — for the footer and exit code.
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
@@ -768,12 +799,16 @@ fn reconcile_rulesets(
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
     for (name, id) in stale_rulesets(list, desired) {
-        let deadlocked = if name == RS_CHECK && !prune {
+        let dead = if prune {
+            None
+        } else if name == RS_CHECK {
             check_ruleset_deadlocks(owner, repo, id)
+        } else if name == RS_PROTECTED {
+            protected_ruleset_dead(owner, repo, id)
         } else {
             None
         };
-        match stale_action(name, prune, deny_enforcing, deadlocked.is_some()) {
+        match stale_action(name, prune, deny_enforcing, dead.is_some()) {
             StaleAction::Remove => {
                 let why = if name == RS_LEGACY_DEFAULT && !prune {
                     format!("superseded by {RS_DENY}")
@@ -788,24 +823,28 @@ fn reconcile_rulesets(
                 }
             }
             StaleAction::Disable => {
-                let branches = deadlocked.unwrap_or_default();
+                let branches = dead.unwrap_or_default();
+                let reason = if name == RS_CHECK {
+                    "no scoped branch can produce the check"
+                } else {
+                    "no scoped branch exists"
+                };
                 if dry_run {
                     println!(
-                        "    ruleset {name}: would disable — no scoped branch \
-                         can produce the check ({})",
+                        "    ruleset {name}: would disable — {reason} ({})",
                         branches.join(", ")
                     );
                 } else {
                     let refs: Vec<&str> = branches.iter().map(String::as_str).collect();
-                    api(
-                        "PUT",
-                        &format!("{base}/{id}"),
-                        Some(&ruleset_check("disabled", &refs)),
-                    )?;
+                    let body = if name == RS_CHECK {
+                        ruleset_check("disabled", &refs)
+                    } else {
+                        ruleset_protected("disabled", &refs)
+                    };
+                    api("PUT", &format!("{base}/{id}"), Some(&body))?;
                     println!(
-                        "    ruleset {name}: disabled — scoped branches {} \
-                         cannot produce the check (deadlock repaired; \
-                         rerun with --prune to remove)",
+                        "    ruleset {name}: disabled — {reason} ({}) \
+                         (dead gate repaired; rerun with --prune to remove)",
                         branches.join(", ")
                     );
                 }
@@ -1053,7 +1092,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exit, deadlock_branches, desired_rulesets, repo_owned, ruleset_check,
+        apply_exit, desired_rulesets, literal_branches, repo_owned, ruleset_check,
         ruleset_protected, ruleset_tags, stale_action, stale_rulesets, urlencode, StaleAction,
         MANAGED_RULESETS,
     };
@@ -1169,9 +1208,14 @@ mod tests {
             stale_action("clean-your-attribution-check", false, false, false),
             StaleAction::Warn
         );
-        // -protected is never auto-touched.
+        // -protected: a provably dead gate (every scoped branch gone)
+        // disarms like a deadlocked -check; a live one is never touched.
         assert_eq!(
             stale_action("clean-your-attribution-protected", false, true, true),
+            StaleAction::Disable
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-protected", false, true, false),
             StaleAction::Warn
         );
         assert_eq!(
@@ -1181,23 +1225,23 @@ mod tests {
     }
 
     #[test]
-    fn deadlock_branches_reads_only_all_literal_scopes() {
+    fn literal_branches_reads_only_all_literal_scopes() {
         let detail =
             |include: serde_json::Value| json!({"conditions": {"ref_name": {"include": include}}});
         assert_eq!(
-            deadlock_branches(&detail(json!(["refs/heads/a", "refs/heads/b"]))),
+            literal_branches(&detail(json!(["refs/heads/a", "refs/heads/b"]))),
             Some(vec!["a".to_string(), "b".to_string()])
         );
         // A symbolic pattern, an empty include, a non-string entry or a
         // missing conditions block are all unprovable — never a deadlock.
-        assert_eq!(deadlock_branches(&detail(json!(["~DEFAULT_BRANCH"]))), None);
+        assert_eq!(literal_branches(&detail(json!(["~DEFAULT_BRANCH"]))), None);
         assert_eq!(
-            deadlock_branches(&detail(json!(["refs/heads/a", "~ALL"]))),
+            literal_branches(&detail(json!(["refs/heads/a", "~ALL"]))),
             None
         );
-        assert_eq!(deadlock_branches(&detail(json!([]))), None);
-        assert_eq!(deadlock_branches(&detail(json!([42]))), None);
-        assert_eq!(deadlock_branches(&json!({})), None);
+        assert_eq!(literal_branches(&detail(json!([]))), None);
+        assert_eq!(literal_branches(&detail(json!([42]))), None);
+        assert_eq!(literal_branches(&json!({})), None);
     }
 
     #[test]
