@@ -121,6 +121,33 @@ deployed, and `cya apply` reports the repo as not fully protected either
 way — a partially enrolled target must be re-applied, never treated as
 covered.
 
+## Branch rollout: two declarations and reconciliation
+
+`cya apply` installs a repo-wide set plus a branch-scoped set, each
+explicitly named — nothing is scoped implicitly:
+
+- **Repo-wide** (`--repos`, `--orgs`, `--users`): the `~ALL` deny
+  ruleset, the `~ALL`-tags admin restriction, and squash-only merge
+  settings.
+- **`--install-refs owner/repo:branch`**: the scan workflow committed
+  directly onto each named branch (or `--local PATH:branch` writes it
+  into a worktree verified to be on the named branch, for the operator
+  to commit and promote).
+- **`--protect-refs owner/repo:branch`**: `clean-your-attribution-protected`
+  requires a pull request on every named branch immediately, and
+  `clean-your-attribution-check` requires the `attribution scan` check
+  on each named branch that already carries the workflow file. A named
+  branch without the file is *pending* — the check joins it on the next
+  apply run once the file lands, never before: requiring a check no
+  branch produces would deadlock the merge meant to carry the file in.
+
+Reconciliation closes the loop: on every run the repo's tool-owned
+rulesets are compared against the declared set, and any managed ruleset
+outside it is deleted — a `check` gate whose last file-carrying branch
+is gone, a `protected` set the operator stopped naming, and the
+superseded pre-0.2.0 `clean-your-attribution-default` ruleset. Each
+removal is printed; nothing tool-owned survives unnamed.
+
 ## Resolution order
 
 1. `--policy-url URL` / `CYA_POLICY_URL` (remote override — lets a fleet update rules without reinstalling),

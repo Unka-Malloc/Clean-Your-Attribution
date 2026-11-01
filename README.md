@@ -17,7 +17,7 @@ tested; the rollout tool builds, but the fleet has not been applied yet.
 | --- | --- | --- |
 | `cya` binary | scans or rewrites commit messages, stripping denied trailers; installs repo hooks; switches local agents' own attribution options off | any machine — yours or a collaborator's, a single static binary |
 | `sig-check.yml` workflow | scans the PR/merge-group commit range, default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
-| `cya apply` | installs the workflow, three rulesets, and squash-only merge settings in every targeted repo — remote or a local checkout | run by an operator locally |
+| `cya apply` | installs the deny + tag rulesets and squash-only merge settings on every named repo; the scan workflow and merge-gate rulesets only on explicitly named `(repo, branch)` pairs — remote or a local checkout | run by an operator locally |
 
 All three resolve from the same source of truth: `policy/trailers.json`,
 which is compiled into the binaries at build time.
@@ -82,9 +82,9 @@ repository administrators. That restriction always deploys `active` —
 an `--enforcement evaluate` staging run must not silently reopen tag
 writes while the workflow skips them; only `disabled` turns it off.
 
-The workflow provisions the `cya` binary from this repository's release
-assets for the runner's OS/arch, falling back to `cargo install --git`
-until releases exist.
+The workflow provisions the `cya` binary from the published crates.io
+package (`cargo install --locked`, registry-resolved and reproducible),
+falling back to `cargo install --git` for unreleased revisions.
 
 `cya apply` rolls all of that out across organizations and accounts:
 

@@ -120,3 +120,9 @@ by hand, every time. The rules, exactly as the policy applies them:
 - The catalogue denies *verified* agent identities only. When in
   doubt whether an identity is an agent, treat it as human and report
   it for the `unverified` list instead of scrubbing a person.
+
+## Install
+
+Link (or copy) the `skill/` directory into the host's skills directory —
+e.g. `~/.agents/skills/clean-your-attribution` — so the skill resolves
+alongside the host's other skills.

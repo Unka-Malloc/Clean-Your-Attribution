@@ -31,11 +31,12 @@ Known cost trade-offs, all deliberate:
 
 ## CI (`ci.yml`)
 
-One `verify` job per push to the default branch and per pull request
-targeting it: toolchain install plus `fmt`/`clippy`/`test`, ~2–4 min on
-GitHub-hosted `ubuntu-latest` — **zero billed minutes** while the
-repository is public (same billing source as above). No schedules, no
-matrices, no credentials.
+One `verify` job per push to `main` and per pull request: toolchain
+install plus `fmt`/`clippy`/`test`, ~2–4 min on GitHub-hosted
+`ubuntu-latest` — **zero billed minutes** while the repository is
+public (same billing source as above). A `concurrency` group cancels
+superseded runs on the same ref; no schedules, no matrices, no
+credentials.
 
 ## Release
 
@@ -43,6 +44,13 @@ Releases are manual: bump `Cargo.toml`, `cargo publish` locally, tag
 `v<version>` and push the tag. Network is the crates.io sparse-index
 check plus one `.crate` upload (≈ 45 KiB compressed, `cargo package`
 measured) and a kilobyte-scale tag push; no runner minutes are spent.
+
+Trust basis, stated plainly: the `.crate` is packaged by `cargo publish`
+from the operator's local checkout under their crates.io credentials —
+there is no build attestation or provenance record beyond the tag
+pointing at the same commit. `sig-check.yml` consumers install the
+binary through `cargo install clean-your-attribution --locked`, so the
+shipped `Cargo.lock` pins every dependency of what they build.
 
 ## Local CLI (`cya`)
 

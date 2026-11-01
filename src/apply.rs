@@ -18,9 +18,10 @@
 //! protected branches is the operator's own pipeline, not this tool's
 //! behavior.
 //!
-//! Credentials: GITHUB_TOKEN if set (via curl), otherwise `gh api`
-//! with --identity personal — the credential never leaves the vault
-//! process; this binary only receives API responses.
+//! Credentials: `GITHUB_TOKEN` if set — sent to api.github.com by curl
+//! with the Authorization header read from a private temp file — else
+//! ambient `gh` auth via `gh api` (the GitHub CLI or a compatible shim).
+//! No credential ever enters argv on either path.
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -137,15 +138,17 @@ impl Drop for TempDir {
 
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
-    // The credential never enters argv: curl -H @file reads the header from
-    // a file inside a unique 0700 temp dir, created O_EXCL with mode 0600 —
-    // the token is never world-readable, never follows a pre-existing path,
-    // and the guard removes it on every return path.
+    // The credential never enters argv: curl -H @file reads the header
+    // from a file created O_EXCL inside a unique temp dir that the guard
+    // removes on every return path. On unix both carry restrictive modes
+    // (dir 0700, file 0600); other platforms get the same O_EXCL
+    // exclusivity inside the private dir under the platform's default
+    // file ACL.
+    use std::io::Write;
     let auth_dir = TempDir::private("auth")?;
     let auth_file = auth_dir.path("header");
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
@@ -155,7 +158,11 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
             .write_all(format!("Authorization: Bearer {token}\n").as_bytes())?;
     }
     #[cfg(not(unix))]
-    fs::write(&auth_file, format!("Authorization: Bearer {token}\n"))?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&auth_file)?
+        .write_all(format!("Authorization: Bearer {token}\n").as_bytes())?;
     let mut argv = vec![
         "-sS".into(),
         "-X".into(),
@@ -359,6 +366,32 @@ const MERGE_SETTINGS: &str = r#"{
   "squash_merge_commit_message": "BLANK"
 }"#;
 
+/// Every ruleset name this tool has ever owned, including the superseded
+/// pre-0.2.0 `~DEFAULT_BRANCH` ruleset — reconciliation removes any of
+/// them the current declaration does not want.
+const MANAGED_RULESETS: [&str; 5] = [
+    "clean-your-attribution",
+    "clean-your-attribution-tags",
+    "clean-your-attribution-protected",
+    "clean-your-attribution-check",
+    "clean-your-attribution-default",
+];
+
+/// The ruleset set a repo should end with: deny + tags always, the
+/// pull_request gate once branches are named, and the required check
+/// only while a named branch already carries the workflow file — an
+/// empty gated set would install a check nothing can produce.
+fn desired_rulesets(protected_named: bool, gated_nonzero: bool) -> Vec<&'static str> {
+    let mut names = vec!["clean-your-attribution", "clean-your-attribution-tags"];
+    if protected_named {
+        names.push("clean-your-attribution-protected");
+        if gated_nonzero {
+            names.push("clean-your-attribution-check");
+        }
+    }
+    names
+}
+
 // ---------------------------------------------------------------- apply --
 
 fn list_paginated(path: &str) -> Result<Vec<Value>> {
@@ -541,16 +574,18 @@ fn ensure_workflow_local(
     Ok(())
 }
 
-fn ensure_ruleset(owner: &str, repo: &str, desired: &Value, dry_run: bool) -> Result<()> {
+fn ensure_ruleset(
+    owner: &str,
+    repo: &str,
+    list: &[Value],
+    desired: &Value,
+    dry_run: bool,
+) -> Result<()> {
     let base = format!("/repos/{owner}/{repo}/rulesets");
-    let list = api("GET", &base, None)?;
     let name = desired["name"].as_str().unwrap_or_default();
     let existing = list
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
-        })
+        .iter()
+        .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
         .and_then(|r| r.get("id").and_then(Value::as_i64));
     if dry_run {
         println!(
@@ -570,6 +605,39 @@ fn ensure_ruleset(owner: &str, repo: &str, desired: &Value, dry_run: bool) -> Re
     } else {
         api("POST", &base, Some(desired))?;
         println!("    ruleset {name}: created");
+    }
+    Ok(())
+}
+
+/// Deletes tool-owned rulesets the current declaration does not want —
+/// a stale `check` ruleset demands a check no branch can produce, which
+/// deadlocks the very merge meant to carry the file back, and a stale
+/// `protected` or superseded `-default` set enforces scopes the operator
+/// never named. Removal is part of the declared set, not a fallback.
+fn reconcile_rulesets(
+    owner: &str,
+    repo: &str,
+    list: &[Value],
+    desired: &[&str],
+    dry_run: bool,
+) -> Result<()> {
+    let base = format!("/repos/{owner}/{repo}/rulesets");
+    for row in list {
+        let Some(name) = row.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !MANAGED_RULESETS.contains(&name) || desired.contains(&name) {
+            continue;
+        }
+        let Some(id) = row.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        if dry_run {
+            println!("    ruleset {name}: would remove (stale)");
+        } else {
+            api("DELETE", &format!("{base}/{id}"), None)?;
+            println!("    ruleset {name}: removed (stale)");
+        }
     }
     Ok(())
 }
@@ -604,15 +672,23 @@ pub fn run(argv: &[String]) -> Result<i32> {
             continue;
         }
         println!("  {full}:");
-        // Returns Ok(true) while an install PR still has to merge before the
-        // required check can activate — pending is not a failure.
+        // Returns Ok(true) while a protected branch still waits on the
+        // workflow file before its check can activate — pending is not a
+        // failure.
         let run = || -> Result<bool> {
+            let rulesets = list_paginated(&format!("/repos/{owner}/{repo}/rulesets?per_page=100"))?;
             // Tag protection lands before the workflow update. On an upgrade
             // path this preserves any older workflow that still scanned tag
             // pushes; on a first install a failure here simply means nothing
             // is deployed yet — either way the run must report the repo as
             // not fully protected rather than claim a partial success.
-            ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
+            ensure_ruleset(
+                owner,
+                repo,
+                &rulesets,
+                &ruleset_tags(&args.enforcement),
+                args.dry_run,
+            )?;
             // The workflow file is the only object that lives inside a
             // branch, so it only goes where the operator explicitly names
             // it: --install-refs (repo, branch) pairs, each a direct commit.
@@ -635,6 +711,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
             ensure_ruleset(
                 owner,
                 repo,
+                &rulesets,
                 &ruleset_deny_trailers(&args.enforcement, &policy),
                 args.dry_run,
             )?;
@@ -649,11 +726,11 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 .filter(|(r, _)| r == full)
                 .map(|(_, b)| b.as_str())
                 .collect();
+            let mut gated = Vec::new();
             let mut awaiting = Vec::new();
             if protect_refs.is_empty() {
                 println!("    protected branches: none named (no --protect-refs for this repo)");
             } else {
-                let mut gated = Vec::new();
                 for branch in &protect_refs {
                     api(
                         "GET",
@@ -672,6 +749,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 ensure_ruleset(
                     owner,
                     repo,
+                    &rulesets,
                     &ruleset_protected(&args.enforcement, &protect_refs),
                     args.dry_run,
                 )?;
@@ -684,6 +762,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                     ensure_ruleset(
                         owner,
                         repo,
+                        &rulesets,
                         &ruleset_check(&args.enforcement, &gated),
                         args.dry_run,
                     )?;
@@ -692,6 +771,17 @@ pub fn run(argv: &[String]) -> Result<i32> {
                     println!("    check@{branch}: deferred until the workflow lands there");
                 }
             }
+            // The declared set is the whole story: any tool-owned ruleset
+            // outside it — a stale check gate, an un-named protected set,
+            // the superseded -default ruleset — is removed, never left
+            // enforcing scopes the operator did not name.
+            reconcile_rulesets(
+                owner,
+                repo,
+                &rulesets,
+                &desired_rulesets(!protect_refs.is_empty(), !gated.is_empty()),
+                args.dry_run,
+            )?;
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");
             } else {
@@ -746,7 +836,9 @@ pub fn run(argv: &[String]) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ruleset_check, ruleset_protected, ruleset_tags};
+    use super::{
+        desired_rulesets, ruleset_check, ruleset_protected, ruleset_tags, MANAGED_RULESETS,
+    };
 
     #[test]
     fn protection_rulesets_scope_only_named_branches() {
@@ -784,5 +876,46 @@ mod tests {
         let bypass = rs["bypass_actors"].as_array().unwrap();
         assert_eq!(bypass.len(), 1);
         assert_eq!(bypass[0]["actor_type"], "RepositoryRole");
+    }
+
+    #[test]
+    fn desired_rulesets_drop_stale_enforcement() {
+        // No branches named: only the repo-wide pair survives — a stale
+        // -protected/-check set or the superseded -default ruleset gets
+        // reconciled away rather than left enforcing unnamed scopes.
+        assert_eq!(
+            desired_rulesets(false, false),
+            ["clean-your-attribution", "clean-your-attribution-tags"]
+        );
+        assert_eq!(
+            desired_rulesets(true, false),
+            [
+                "clean-your-attribution",
+                "clean-your-attribution-tags",
+                "clean-your-attribution-protected"
+            ]
+        );
+        assert_eq!(
+            desired_rulesets(true, true),
+            [
+                "clean-your-attribution",
+                "clean-your-attribution-tags",
+                "clean-your-attribution-protected",
+                "clean-your-attribution-check"
+            ]
+        );
+        // The check gate can never be desired without protected branches,
+        // and the legacy default-branch name is never desired at all.
+        for desired in [
+            desired_rulesets(false, false),
+            desired_rulesets(true, false),
+            desired_rulesets(true, true),
+        ] {
+            assert!(!desired.contains(&"clean-your-attribution-default"));
+            for name in &desired {
+                assert!(MANAGED_RULESETS.contains(name));
+            }
+        }
+        assert!(MANAGED_RULESETS.contains(&"clean-your-attribution-default"));
     }
 }

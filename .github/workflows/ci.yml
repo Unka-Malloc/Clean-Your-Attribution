@@ -1,11 +1,19 @@
-# The per-change gate: pushes to the default branch and pull requests
-# targeting it run the repository's own verify command — fmt, clippy,
-# tests. No credentials, no publishing identity.
+# The per-change gate: pushes to the default branch and every pull
+# request run the repository's own verify command — fmt, clippy, tests.
+# No credentials, no publishing identity. Superseded runs on the same
+# ref are cancelled.
 name: ci
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:

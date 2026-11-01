@@ -5,9 +5,9 @@ name: clean-your-attribution
 #   ruleset "Require workflows to pass" rule — no per-repo caller needed.
 # - workflow_call: can be reused by a thin caller file in repositories where
 #   ruleset workflow references are unavailable.
-# The cya binary is provisioned from this repository's latest release asset
-# for the runner's OS/arch, falling back to `cargo install --git` until a
-# release exists. The policy travels inside the binary.
+# The cya binary is provisioned from the published crates.io package —
+# registry-resolved and lockfile-pinned — with `cargo install --git` as
+# the pre-release fallback. The policy travels inside the binary.
 
 on:
   workflow_call:
@@ -71,27 +71,18 @@ jobs:
       - name: Provision cya
         run: |
           set -e
-          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-          arch="$(uname -m)"
-          asset="cya-${os}-${arch}"
-          base="https://github.com/${{ github.repository_owner }}/clean-your-attribution"
-          for origin in "$base" "https://github.com/Unka-Malloc/Clean-Your-Attribution"; do
-            if curl -fsSL "$origin/releases/latest/download/$asset" -o "$RUNNER_TEMP/cya"; then
-              chmod +x "$RUNNER_TEMP/cya"
-              break
-            fi
-            origin=""
-          done
-          if [ -z "$origin" ]; then
-            # No release asset yet — build from source. Runners ship Rust.
+          # The published crate is the pinned path — the registry resolves
+          # the version and --locked keeps its shipped lockfile. --git is
+          # the pre-release fallback for unreleased revisions.
+          if ! cargo install clean-your-attribution --locked \
+                --root "$RUNNER_TEMP/cya-home" --bin cya; then
             cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
               --locked --root "$RUNNER_TEMP/cya-home" --bin cya
-            ln -sf "$RUNNER_TEMP/cya-home/bin/cya" "$RUNNER_TEMP/cya"
           fi
-          "$RUNNER_TEMP/cya" policy --check
+          "$RUNNER_TEMP/cya-home/bin/cya" policy --check
 
       - name: Scan commit range
-        run: "$RUNNER_TEMP/cya" scan --range "${{ steps.range.outputs.range }}"
+        run: "$RUNNER_TEMP/cya-home/bin/cya" scan --range "${{ steps.range.outputs.range }}"
 
       - name: Scan pull request title and body
         if: github.event_name == 'pull_request'
@@ -99,4 +90,4 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | "$RUNNER_TEMP/cya" scan --stdin
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | "$RUNNER_TEMP/cya-home/bin/cya" scan --stdin
