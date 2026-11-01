@@ -4,8 +4,8 @@
 
 Every subcommand runs inside the repository checkout, writes step outputs to
 $GITHUB_OUTPUT and a readable report to $GITHUB_STEP_SUMMARY. RELEASE_KIND
-says what started the run: `train` (the weekly schedule), `manual` (Run
-workflow) or `tag` (a pushed version tag).
+says what started the run: `train` (the weekly schedule) or `manual` (Run
+workflow).
 """
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ SAFE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 DEP_KEYS = ("dependencies", "dev-dependencies", "build-dependencies")
 POLL_SECONDS = int(os.environ.get("TRAIN_POLL_SECONDS", "300"))
-INDEX = "https://index.crates.io"
+# The sparse-index base. CARGO_REGISTRY_INDEX overrides it (a mirror or a
+# fixture); publish.yml's shell probe shares the same default — keep them
+# in sync.
+INDEX = (os.environ.get("CARGO_REGISTRY_INDEX") or "https://index.crates.io").rstrip("/")
 
 
 class TrainError(Exception):
@@ -223,13 +226,10 @@ def remote_tags(slug: str) -> dict[tuple[int, int, int], str]:
 def cmd_candidate(args: argparse.Namespace) -> int:
     mode = os.environ.get("RELEASE_MODE", "dry-run")
     kind = os.environ.get("RELEASE_KIND", "train")
-    nightly = git_ok("rev-parse", "--verify", "-q", "refs/remotes/origin/nightly")
-    if kind == "train" and mode == "live" and not nightly:
-        raise TrainError("a live train needs the `nightly` branch")
     # The publish gate binds the candidate to the default-branch run head,
-    # so selection must live on that same branch: a `nightly` side line
-    # would pick candidates the gate is bound to reject. A repository that
-    # releases from `nightly` makes it the default branch.
+    # so selection must live on that same branch: a side line would pick
+    # candidates the gate is bound to reject, and the release's back-merge
+    # lands on this branch too.
     branch = args.default_branch
     cutoff = ""
     if args.override:
@@ -280,7 +280,9 @@ def cmd_deps(args: argparse.Namespace) -> int:
         print(f"dependencies not on crates.io yet: {' '.join(problem)}", flush=True)
         time.sleep(POLL_SECONDS)
     rows, refs = [], {}
-    for position, sibling in enumerate(siblings):
+    # Refs are keyed by sibling directory, not position: a reordered
+    # declaration can never pair a checkout with the wrong resolved tag.
+    for sibling in siblings:
         tags = remote_tags(sibling["slug"])
         versions = sorted(resolved[c] for c in sibling["crates"] if c in resolved)
         if versions:
@@ -292,7 +294,7 @@ def cmd_deps(args: argparse.Namespace) -> int:
             ref = tags[max(tags)]
         else:
             raise TrainError(f"{sibling['slug']} has no release tag to build against")
-        refs[f"ref_{position}"] = ref
+        refs[f"ref_{sibling['dir']}"] = ref
         rows.append(f"| {sibling['dir']} | `{ref}` |")
     report("### Dependencies\n\n| Sibling | Checked out |\n| --- | --- |\n" + "\n".join(rows))
     emit(ready="true", **refs)
@@ -377,11 +379,17 @@ def cargo_metadata(repo: pathlib.Path) -> dict:
     --manifest-path so a checkout's .cargo/config.toml — a credential
     provider is executable — can never load beside the release identity.
     --no-deps suffices: member manifests carry their own dependencies."""
-    done = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--no-deps",
-         "--manifest-path", str(repo / "Cargo.toml")],
-        cwd=tempfile.mkdtemp(), capture_output=True, text=True, check=True,
-    )
+    with tempfile.TemporaryDirectory() as scratch:
+        try:
+            done = subprocess.run(
+                ["cargo", "metadata", "--format-version", "1", "--no-deps",
+                 "--manifest-path", str(repo / "Cargo.toml")],
+                cwd=scratch, capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as error:
+            tail = (error.stderr or "").strip().splitlines()
+            raise TrainError(
+                f"cargo metadata failed: {tail[-1] if tail else 'unknown error'}")
     return json.loads(done.stdout)
 
 
@@ -405,41 +413,33 @@ def cmd_version(args: argparse.Namespace) -> int:
     released = [v for v in tags if v in on_registry]
     last_tag = tags[max(released)] if released else None
     notes, pulls = [], []
-    if kind == "tag":
-        tag = os.environ.get("GITHUB_REF_NAME", "")
-        upcoming, level, changed = parse_version(tag[1:]), "tag", True
-        stale = sorted(p["name"] for p in publishable if parse_version(p["version"]) != upcoming)
-        if stale:
-            raise TrainError(f"{tag} does not match the manifests of {', '.join(stale)}; set them "
-                             f"to {show(upcoming)} before tagging, or use Run workflow")
+    if last_tag:
+        changed = not git_ok("diff", "--quiet", last_tag, args.candidate)
     else:
-        if last_tag:
-            changed = not git_ok("diff", "--quiet", last_tag, args.candidate)
-        else:
-            changed = True
-            notes.append("No tag matches a published version, so the whole history counts as new.")
-        if tags and max(tags) not in on_registry:
-            notes.append(f"`{tags[max(tags)]}` is tagged but not on crates.io; its number is "
-                         "skipped.")
-        requested = None
-        if kind == "manual":
-            level = os.environ.get("INPUT_LEVEL") or "patch"
-            if level not in LEVELS:
-                raise TrainError(f"unknown level {level!r}")
-            text = (os.environ.get("INPUT_VERSION") or "").strip().removeprefix("v")
-            if text:
-                requested = parse_version(text)
-                if requested is None:
-                    raise TrainError(f"version {text!r} is not <major>.<minor>.<patch>")
-                level = "exact"
-        else:
-            level = "patch"
-            if changed and last_tag and args.branch:
-                level, pulls = labelled_level(slug, args.branch, args.candidate, last_tag)
-        upcoming, resume = choose_version(manifest, published, set(tags), level, requested)
-        if resume:
-            changed = True
-            notes.append(f"{show(upcoming)} is only partly on crates.io; this run finishes it.")
+        changed = True
+        notes.append("No tag matches a published version, so the whole history counts as new.")
+    if tags and max(tags) not in on_registry:
+        notes.append(f"`{tags[max(tags)]}` is tagged but not on crates.io; its number is "
+                     "skipped.")
+    requested = None
+    if kind == "manual":
+        level = os.environ.get("INPUT_LEVEL") or "patch"
+        if level not in LEVELS:
+            raise TrainError(f"unknown level {level!r}")
+        text = (os.environ.get("INPUT_VERSION") or "").strip().removeprefix("v")
+        if text:
+            requested = parse_version(text)
+            if requested is None:
+                raise TrainError(f"version {text!r} is not <major>.<minor>.<patch>")
+            level = "exact"
+    else:
+        level = "patch"
+        if changed and last_tag and args.branch:
+            level, pulls = labelled_level(slug, args.branch, args.candidate, last_tag)
+    upcoming, resume = choose_version(manifest, published, set(tags), level, requested)
+    if resume:
+        changed = True
+        notes.append(f"{show(upcoming)} is only partly on crates.io; this run finishes it.")
     done = sorted(name for name, versions in published.items() if upcoming in versions)
     fresh = sorted(name for name, versions in published.items() if not versions)
     if fresh:
@@ -450,7 +450,7 @@ def cmd_version(args: argparse.Namespace) -> int:
         notes.append(f"Every crate already holds {show(upcoming)} on crates.io.")
     excludes = sorted({p["name"] for p in packages if p not in publishable} | set(done))
     needs_set = any(parse_version(p["version"]) != upcoming for p in publishable)
-    source = {"train": "pull request labels", "manual": "Run workflow input", "tag": "pushed tag"}
+    source = {"train": "pull request labels", "manual": "Run workflow input"}
     summary = [
         "### Version",
         "",
@@ -533,6 +533,124 @@ def cmd_freshness(args: argparse.Namespace) -> int:
     return 0
 
 
+SECTION = re.compile(r"^\[\[?\s*(?P<name>.+?)\s*\]?\]\s*(?:#.*)?$")
+ENTRY = re.compile(
+    r"^(?P<key>'[^']+'|\"[^\"]+\"|[A-Za-z0-9_-]+)"
+    r"(?:\.(?P<sub>[A-Za-z0-9_-]+))?\s*=\s*(?P<value>.*)$"
+)
+VERSION_FIELD = re.compile(r'version\s*=\s*"[^"]*"')
+WORKSPACE_FIELD = re.compile(r"\bworkspace\s*=\s*true\b")
+PACKAGE_FIELD = re.compile(r'package\s*=\s*"([^"]+)"')
+
+
+def section_of(line: str) -> str | None:
+    """The table name a `[a.b]`/`[[a.b]]` header opens, or None."""
+    text = line.strip()
+    if not text.startswith("["):
+        return None
+    found = SECTION.match(text)
+    if not found:
+        return None
+    return found.group("name").rstrip("]").strip()
+
+
+def brace_depth(text: str) -> int:
+    """`{` minus `}` outside quoted strings, for multi-line inline tables."""
+    depth, quote, escaped = 0, "", False
+    for ch in text:
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    return depth
+
+
+def rewrite_manifest(path: pathlib.Path, members: set[str], next_v: str) -> int:
+    """Move a manifest to `next_v`: `[package]`/`[workspace.package]` version
+    and every dependency-table entry whose package names a workspace member
+    — the coordinated bump keeps manifests internally consistent, so the
+    lockfile update afterwards resolves against the new member versions."""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    out, section, edited, index = [], "", 0, 0
+    while index < len(lines):
+        line = lines[index]
+        found = section_of(line)
+        if found is not None:
+            section = found
+        else:
+            last = section.rsplit(".", 1)[-1].strip().strip("'\"")
+            stripped = line.strip()
+            if last == "package" and re.match(r'^version\s*=\s*"', stripped):
+                line = VERSION_FIELD.sub(f'version = "{next_v}"', line, count=1)
+                edited += 1
+            elif last in DEP_KEYS:
+                entry = ENTRY.match(stripped)
+                if entry and entry.group("sub") == "version" \
+                        and entry.group("key").strip("'\"") in members:
+                    line = re.sub(r'=\s*"[^"]*"', f'= "{next_v}"', line, count=1)
+                    edited += 1
+                elif entry and entry.group("sub") is None:
+                    block = [line]
+                    while brace_depth("".join(block)) > 0 and index + 1 < len(lines):
+                        index += 1
+                        block.append(lines[index])
+                    text = "".join(block)
+                    value = entry.group("value")
+                    package = PACKAGE_FIELD.search(text)
+                    if not WORKSPACE_FIELD.search(text) \
+                            and (package.group(1) if package else entry.group("key").strip("'\"")) in members:
+                        if VERSION_FIELD.search(text):
+                            text = VERSION_FIELD.sub(f'version = "{next_v}"', text, count=1)
+                        elif value.lstrip().startswith('"'):
+                            text = re.sub(r'=\s*"[^"]*"', f'= "{next_v}"', text, count=1)
+                        elif "{" in text:
+                            opening = re.search(r"\{(\s*)", text)
+                            gap = opening.group(1)
+                            closing = text[opening.end(1):].lstrip().startswith("}")
+                            comma = "" if closing else ","
+                            insert = (f'version = "{next_v}"{comma}' + gap
+                                      if "\n" in gap else f'version = "{next_v}"{comma} ')
+                            text = text[:opening.end(1)] + insert + text[opening.end(1):]
+                        edited += 1
+                    line = text
+        out.append(line)
+        index += 1
+    if edited:
+        path.write_text("".join(out), encoding="utf-8")
+    return edited
+
+
+def set_version(repo: pathlib.Path, next_v: str) -> int:
+    """cargo_metadata-driven rewrite, data only: every member manifest and
+    the workspace root — where [workspace.dependencies] pins member
+    requirements — so no path dep is left requiring the old numbers."""
+    metadata = cargo_metadata(repo)
+    member_ids = set(metadata["workspace_members"])
+    packages = [p for p in metadata["packages"] if p["id"] in member_ids]
+    members = {p["name"] for p in packages}
+    files = {pathlib.Path(p["manifest_path"]) for p in packages}
+    files.add(pathlib.Path(metadata["workspace_root"]) / "Cargo.toml")
+    return sum(rewrite_manifest(path, members, next_v) for path in sorted(files))
+
+
+def cmd_set_version(args: argparse.Namespace) -> int:
+    if parse_version(args.version) is None:
+        raise TrainError(f"set-version wants <major>.<minor>.<patch>, got {args.version!r}")
+    edited = set_version(pathlib.Path.cwd(), args.version)
+    report(f"### Version bump\n\nSet every workspace member and member requirement "
+           f"to `{args.version}` ({edited} field(s) rewritten).")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="release.py")
     commands = root.add_subparsers(dest="command", required=True)
@@ -552,6 +670,9 @@ def parser() -> argparse.ArgumentParser:
     version.set_defaults(run=cmd_version)
     order = commands.add_parser("order")
     order.set_defaults(run=cmd_order)
+    set_version_cmd = commands.add_parser("set-version")
+    set_version_cmd.add_argument("version")
+    set_version_cmd.set_defaults(run=cmd_set_version)
     freshness = commands.add_parser("freshness")
     freshness.add_argument("--window-days", type=int, default=14)
     freshness.set_defaults(run=cmd_freshness)
