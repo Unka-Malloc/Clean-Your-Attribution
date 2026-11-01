@@ -188,6 +188,24 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ApiNotFound>().is_some()
 }
 
+/// The verdict an HTTP status carries: only 2xx is data, only 404/410 is
+/// a provable absence, and everything else — redirects, 4xx/5xx, a lost
+/// `-w` marker — is a transport failure. Pure so the boundary a dead-gate
+/// proof depends on is pinned by tests.
+enum HttpOutcome {
+    Data,
+    NotFound,
+    Transport,
+}
+
+fn http_outcome(status: u16) -> HttpOutcome {
+    match status {
+        200..=299 => HttpOutcome::Data,
+        404 | 410 => HttpOutcome::NotFound,
+        _ => HttpOutcome::Transport,
+    }
+}
+
 /// Splits curl's `-w "\n%{http_code}"` framing into (status, body) —
 /// the trailer line is always the last one. An absent or unparseable
 /// marker yields status 0, which classifies as a generic failure, never
@@ -256,18 +274,21 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     // gone" answer, and anything else — redirects included, curl runs
     // without -L — fails closed as a transport error.
     let (status, body_text) = split_http_status(&text);
-    if status == 404 || status == 410 {
-        return Err(ApiNotFound {
-            context: format!("{method} {path}"),
+    match http_outcome(status) {
+        HttpOutcome::NotFound => {
+            return Err(ApiNotFound {
+                context: format!("{method} {path}"),
+            }
+            .into());
         }
-        .into());
-    }
-    if !(200..=299).contains(&status) {
-        let msg = serde_json::from_str::<Value>(body_text)
-            .ok()
-            .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default();
-        bail!("API error {method} {path}: HTTP {status} {msg}");
+        HttpOutcome::Data => {}
+        HttpOutcome::Transport => {
+            let msg = serde_json::from_str::<Value>(body_text)
+                .ok()
+                .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            bail!("API error {method} {path}: HTTP {status} {msg}");
+        }
     }
     if body_text.trim().is_empty() {
         return Ok(Value::Null);
@@ -789,8 +810,10 @@ enum StaleAction {
 }
 
 /// The two managed names whose rulesets are scoped to literal branches —
-/// the only kinds that can go provably dead. One definition feeds the
-/// probe gate, the action classifier and the reconcile match.
+/// the only kinds that can go provably dead. Feeds `probe_needed` and
+/// `stale_action`; the proof dispatch in `reconcile_rulesets` must stay
+/// in sync — a name admitted here without a proof arm there degrades
+/// silently to "never dead".
 fn branch_scoped_gate(name: &str) -> bool {
     matches!(name, RS_CHECK | RS_PROTECTED)
 }
@@ -885,8 +908,9 @@ fn reconcile_rulesets(
         let Some(id) = row.get("id").and_then(Value::as_i64) else {
             // A managed name without a usable id cannot be addressed by
             // the API — report it and count it rather than silently
-            // dropping a possibly-still-enforcing gate.
-            println!("  ruleset {name}: stale — malformed listing row (no usable id), cannot be reconciled");
+            // dropping a possibly-still-enforcing gate. `--prune` cannot
+            // reach it either; it needs manual removal.
+            println!("  ruleset {name}: stale — malformed listing row (no usable id); --prune cannot address it, remove manually");
             left += 1;
             continue;
         };
@@ -897,6 +921,8 @@ fn reconcile_rulesets(
         let dead = if !probe_needed(name, prune, already_disabled) {
             None
         } else {
+            // One proof arm per name `branch_scoped_gate` admits — keep
+            // them in lockstep or a new gate kind silently never disarms.
             match name {
                 RS_CHECK => proven_dead(owner, repo, id, |b| {
                     match workflow_file(owner, repo, Some(b)) {
@@ -1199,9 +1225,10 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dead, apply_exit, desired_rulesets, gh_http_status, literal_branches, probe_needed,
-        repo_owned, ruleset_check, ruleset_protected, ruleset_tags, split_http_status,
-        stale_action, stale_rows, urlencode, BranchVerdict, StaleAction, MANAGED_RULESETS,
+        all_dead, apply_exit, desired_rulesets, gh_http_status, http_outcome, literal_branches,
+        probe_needed, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
+        split_http_status, stale_action, stale_rows, urlencode, BranchVerdict, HttpOutcome,
+        StaleAction, MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -1369,6 +1396,14 @@ mod tests {
         assert_eq!(split_http_status("{}\n404"), (404, "{}"));
         assert_eq!(split_http_status("{}\n410"), (410, "{}"));
         assert_eq!(split_http_status("{}\n301"), (301, "{}"));
+        // Only 2xx is data; only 404/410 is provable absence.
+        assert!(matches!(http_outcome(200), HttpOutcome::Data));
+        assert!(matches!(http_outcome(204), HttpOutcome::Data));
+        assert!(matches!(http_outcome(301), HttpOutcome::Transport));
+        assert!(matches!(http_outcome(403), HttpOutcome::Transport));
+        assert!(matches!(http_outcome(0), HttpOutcome::Transport));
+        assert!(matches!(http_outcome(404), HttpOutcome::NotFound));
+        assert!(matches!(http_outcome(410), HttpOutcome::NotFound));
         assert_eq!(split_http_status("{}\n403"), (403, "{}"));
         assert_eq!(split_http_status("{}\n502"), (502, "{}"));
         // Absent or unparseable markers classify as 0 — never NotFound.
