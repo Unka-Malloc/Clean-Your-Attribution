@@ -127,8 +127,8 @@ covered.
 explicitly named at install time. Enforcement declared by an earlier
 run persists until `--prune` removes it — a run never silently widens
 or narrows what an operator previously named, except the two provable
-repairs described below (the redundant `-default` and a deadlocked
-`-check`):
+repairs described below (the redundant `-default` and a gate that
+provably cannot fire):
 
 - **Repo-wide** (`--repos`, `--orgs`, `--users`): the `~ALL` deny
   ruleset, the `~ALL`-tags admin restriction, and squash-only merge
@@ -164,11 +164,12 @@ ruleset whose every literal scoped branch lacks the workflow, or a
 keeps enforcing and is *warned* about and counted — the run footer
 names the leftover and the exit code reports it: a `-check` gate a run
 no longer names while some scoped branch still produces the check, or
-a `protected` set the operator stopped naming. With `--prune` those
-leftovers are deleted and each removal printed. A partial rerun — a
-policy refresh naming no refs — can therefore never silently strip
-gates it did not restate; only `includes_parents=false` repo-owned
-rulesets are ever in scope.
+a `protected` set the operator stopped naming while its scoped
+branches still exist. With `--prune` those leftovers are deleted and
+each removal printed. A partial rerun — a policy refresh naming no
+refs — can therefore never silently strip a *live* gate it did not
+restate; only `includes_parents=false` repo-owned rulesets are ever
+in scope.
 
 Exit codes: `0` the declared state fully landed; `1` one or more repos
 failed; `3` the run succeeded but left stale tool-owned rulesets —

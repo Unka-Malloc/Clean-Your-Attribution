@@ -64,4 +64,8 @@ what scanned a commit.
 Single-shot processes: one `git log` read per scan, linear regex
 matching per commit, no daemons, no polling, no retry loops. `cya apply`
 pages GitHub list endpoints at 100/page — the minimum request count the
-API allows — and stops on the first empty page.
+API allows — and stops on the first empty page. A dead-gate probe costs
+one ruleset-detail GET plus one read per literal scoped branch, issued
+only for stale `-check`/`-protected` rows that are not already
+`disabled` — an already-disarmed gate is reported without any write or
+per-branch reads.

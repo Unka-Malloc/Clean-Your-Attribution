@@ -165,6 +165,27 @@ impl Drop for TempDir {
     }
 }
 
+/// The API answered "this object does not exist" — the only absence
+/// signal the safety probes may trust, carried as a typed error so
+/// `is_not_found` never has to substring-match prose (a repo named
+/// `404-archive` or a 403 message can contain the same digits).
+#[derive(Debug)]
+struct ApiNotFound {
+    context: String,
+}
+
+impl std::fmt::Display for ApiNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API error {}: 404 Not Found", self.context)
+    }
+}
+
+impl std::error::Error for ApiNotFound {}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ApiNotFound>().is_some()
+}
+
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
     // The credential never enters argv and never touches a file: curl
@@ -192,6 +213,8 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     }
     argv.push("-H".into());
     argv.push("X-GitHub-Api-Version: 2022-11-28".into());
+    argv.push("-w".into());
+    argv.push("\n%{http_code}".into());
     argv.push(format!("https://api.github.com{path}"));
     let mut child = Command::new("curl")
         .args(&argv)
@@ -209,17 +232,27 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     drop(body_dir);
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
-    if text.trim().is_empty() {
+    // curl success ≠ API success — classify on the real status line, not
+    // on prose. 404/410 is the only provable "object is gone" answer.
+    let (body_text, code) = text.rsplit_once('\n').unwrap_or((text.as_str(), ""));
+    let status: u16 = code.trim().parse().unwrap_or(0);
+    if status == 404 || status == 410 {
+        return Err(ApiNotFound {
+            context: format!("{method} {path}"),
+        }
+        .into());
+    }
+    if status >= 400 {
+        let msg = serde_json::from_str::<Value>(body_text)
+            .ok()
+            .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        bail!("API error {method} {path}: HTTP {status} {msg}");
+    }
+    if body_text.trim().is_empty() {
         return Ok(Value::Null);
     }
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    // curl success ≠ API success: surface HTTP-layer errors the API returns.
-    if let Some(msg) = value.get("message").and_then(Value::as_str) {
-        if value.get("documentation_url").is_some() || msg.contains("Not Found") {
-            bail!("API error {method} {path}: {msg}");
-        }
-    }
-    Ok(value)
+    Ok(serde_json::from_str(body_text).unwrap_or(Value::Null))
 }
 
 fn api_gh(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -238,11 +271,21 @@ fn api_gh(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let out = Command::new("gh").args(&argv).output();
     drop(body_dir);
     let out = out.context("gh failed to run")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "gh api {method} {path}: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // gh reports errors as `gh: <msg> (HTTP <code>)` — the "(HTTP nnn)"
+        // token is the transport's own status, safe to classify on.
+        let status = stderr
+            .find("(HTTP ")
+            .and_then(|i| stderr[i + 6..i + 9].parse::<u16>().ok());
+        if matches!(status, Some(404 | 410)) {
+            return Err(ApiNotFound {
+                context: format!("{method} {path}"),
+            }
+            .into());
+        }
+        bail!("gh api {method} {path}: {}", stderr.trim());
+    }
     let text = String::from_utf8(out.stdout)?;
     Ok(if text.trim().is_empty() {
         Value::Null
@@ -484,8 +527,7 @@ fn workflow_file(owner: &str, repo: &str, git_ref: Option<&str>) -> Result<Optio
         Ok(v) if v.get("sha").and_then(Value::as_str).is_some() => Ok(Some(v)),
         Ok(_) => Ok(None),
         Err(e) => {
-            let msg = format!("{e:#}");
-            if msg.contains("Not Found") || msg.contains("404") {
+            if is_not_found(&e) {
                 Ok(None)
             } else {
                 Err(e)
@@ -649,15 +691,15 @@ fn ensure_ruleset(
     Ok(())
 }
 
-/// The managed-but-undesired entries in a ruleset listing: what
-/// `--prune` deletes and what a plain run warns about. Pure — the
-/// destructive decision is testable without touching the API.
-fn stale_rulesets<'a>(list: &'a [Value], desired: &[&str]) -> Vec<(&'a str, i64)> {
+/// The managed-but-undesired rows in a ruleset listing: what `--prune`
+/// deletes and what a plain run warns about or disarms. Pure — the
+/// selection is testable without touching the API; the caller reads
+/// name/id/enforcement off each row.
+fn stale_rows<'a>(list: &'a [Value], desired: &[&str]) -> Vec<&'a Value> {
     list.iter()
-        .filter_map(|row| {
-            let name = row.get("name").and_then(Value::as_str)?;
-            let id = row.get("id").and_then(Value::as_i64)?;
-            (MANAGED_RULESETS.contains(&name) && !desired.contains(&name)).then_some((name, id))
+        .filter(|row| {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
+            MANAGED_RULESETS.contains(&name) && !desired.contains(&name)
         })
         .collect()
 }
@@ -675,8 +717,9 @@ fn repo_owned(row: &Value) -> bool {
 /// The literal branch refs a branch-scoped ruleset detail declares in
 /// its include list. `None` when the scope is not provable from the
 /// payload alone — a symbolic pattern (`~ALL`, `~DEFAULT_BRANCH`), an
-/// empty include list, or a missing conditions block — so only an
-/// all-literal scope can ever be judged dead.
+/// fnmatch glob (`refs/heads/release/**` matches live branches a probe
+/// cannot enumerate), an empty include list, or a missing conditions
+/// block — so only an all-literal scope can ever be judged dead.
 fn literal_branches(detail: &Value) -> Option<Vec<String>> {
     let includes = detail
         .get("conditions")?
@@ -688,7 +731,11 @@ fn literal_branches(detail: &Value) -> Option<Vec<String>> {
     }
     let mut branches = Vec::with_capacity(includes.len());
     for pattern in includes {
-        branches.push(pattern.as_str()?.strip_prefix("refs/heads/")?.to_string());
+        let branch = pattern.as_str()?.strip_prefix("refs/heads/")?;
+        if branch.is_empty() || branch.contains(['*', '?', '[', ']']) {
+            return None;
+        }
+        branches.push(branch.to_string());
     }
     Some(branches)
 }
@@ -721,7 +768,7 @@ fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bo
             StaleAction::Warn
         };
     }
-    if matches!(name, n if n == RS_CHECK || n == RS_PROTECTED) && !prune && provably_dead {
+    if !prune && provably_dead && matches!(name, RS_CHECK | RS_PROTECTED) {
         return StaleAction::Disable;
     }
     if prune {
@@ -731,51 +778,43 @@ fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bo
     }
 }
 
-/// Probes whether a live `-check` ruleset is a proven deadlock: its
-/// scope is all-literal and no scoped branch carries the workflow file.
-/// Returns the scoped branch names when proven — `None` for anything
-/// not provable, including a detail or file read that fails, which the
-/// caller treats as "leave to the declared-set paths" rather than a
-/// repo failure.
-fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Option<Vec<String>> {
-    let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None).ok()?;
-    let branches = literal_branches(&detail)?;
-    for branch in &branches {
-        match workflow_file(owner, repo, Some(branch)) {
-            Ok(Some(_)) => return None,
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-    }
-    Some(branches)
+/// What one scoped branch tells a dead-gate proof: Alive defeats the
+/// verdict at once, Unknown makes it unprovable — only all-Dead is a
+/// proven dead scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchVerdict {
+    Alive,
+    Dead,
+    Unknown,
 }
 
-/// Probes whether a live `-protected` ruleset is a dead gate: its scope
-/// is all-literal and none of the scoped branches exists any more. A
-/// gate that can never fire is disarmed like a deadlocked `-check`;
-/// `None` covers anything not provable, read failures included.
-fn protected_ruleset_dead(owner: &str, repo: &str, id: i64) -> Option<Vec<String>> {
+/// Short-circuiting fold over branch verdicts: the first Alive or
+/// Unknown stops the proof (the probe iterator is lazy, so no further
+/// branch GETs are spent). An empty scope is not provable.
+fn all_dead(verdicts: impl Iterator<Item = BranchVerdict>) -> bool {
+    let mut saw = false;
+    for v in verdicts {
+        if v != BranchVerdict::Dead {
+            return false;
+        }
+        saw = true;
+    }
+    saw
+}
+
+/// The shared dead-gate proof: fetch the ruleset detail, require an
+/// all-literal scope, and fold every scoped branch's verdict. Returns
+/// the scope when the gate provably cannot fire — `None` for anything
+/// not provable, including a detail read that fails, which the caller
+/// treats as "leave to the declared-set paths" rather than a repo
+/// failure.
+fn proven_dead<F>(owner: &str, repo: &str, id: i64, probe: F) -> Option<Vec<String>>
+where
+    F: Fn(&str) -> BranchVerdict,
+{
     let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None).ok()?;
     let branches = literal_branches(&detail)?;
-    for branch in &branches {
-        match api(
-            "GET",
-            &format!("/repos/{owner}/{repo}/git/ref/heads/{}", urlencode(branch)),
-            None,
-        ) {
-            Ok(_) => return None,
-            Err(e) => {
-                // 404 means the branch is gone; any other failure is
-                // not provable — a transient error must not disarm a
-                // live gate.
-                let msg = format!("{e:#}");
-                if !msg.contains("Not Found") && !msg.contains("404") {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(branches)
+    all_dead(branches.iter().map(|b| probe(b))).then_some(branches)
 }
 
 /// Reconciles a repo's ruleset listing against the declared set, tiered
@@ -798,15 +837,37 @@ fn reconcile_rulesets(
 ) -> Result<usize> {
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
-    for (name, id) in stale_rulesets(list, desired) {
-        let dead = if prune {
+    for row in stale_rows(list, desired) {
+        let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
+        let id = row.get("id").and_then(Value::as_i64).unwrap_or_default();
+        // An already-disabled gate needs neither probes nor a PUT: it is
+        // still undeclared, so it counts as left — but no requests are
+        // spent reaching a state that is already in place.
+        let already_disabled = row.get("enforcement").and_then(Value::as_str) == Some("disabled");
+        let dead = if prune || already_disabled {
             None
-        } else if name == RS_CHECK {
-            check_ruleset_deadlocks(owner, repo, id)
-        } else if name == RS_PROTECTED {
-            protected_ruleset_dead(owner, repo, id)
         } else {
-            None
+            match name {
+                n if n == RS_CHECK => proven_dead(owner, repo, id, |b| {
+                    match workflow_file(owner, repo, Some(b)) {
+                        Ok(Some(_)) => BranchVerdict::Alive,
+                        Ok(None) => BranchVerdict::Dead,
+                        Err(_) => BranchVerdict::Unknown,
+                    }
+                }),
+                n if n == RS_PROTECTED => proven_dead(owner, repo, id, |b| {
+                    match api(
+                        "GET",
+                        &format!("/repos/{owner}/{repo}/git/ref/heads/{}", urlencode(b)),
+                        None,
+                    ) {
+                        Ok(_) => BranchVerdict::Alive,
+                        Err(e) if is_not_found(&e) => BranchVerdict::Dead,
+                        Err(_) => BranchVerdict::Unknown,
+                    }
+                }),
+                _ => None,
+            }
         };
         match stale_action(name, prune, deny_enforcing, dead.is_some()) {
             StaleAction::Remove => {
@@ -852,7 +913,11 @@ fn reconcile_rulesets(
             }
             StaleAction::Warn => {
                 left += 1;
-                println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
+                if already_disabled {
+                    println!("    ruleset {name}: stale — already disabled (rerun with --prune to remove)");
+                } else {
+                    println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
+                }
             }
         }
     }
@@ -1092,9 +1157,9 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exit, desired_rulesets, literal_branches, repo_owned, ruleset_check,
-        ruleset_protected, ruleset_tags, stale_action, stale_rulesets, urlencode, StaleAction,
-        MANAGED_RULESETS,
+        all_dead, apply_exit, desired_rulesets, literal_branches, repo_owned, ruleset_check,
+        ruleset_protected, ruleset_tags, stale_action, stale_rows, urlencode, BranchVerdict,
+        StaleAction, MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -1242,6 +1307,16 @@ mod tests {
         assert_eq!(literal_branches(&detail(json!([]))), None);
         assert_eq!(literal_branches(&detail(json!([42]))), None);
         assert_eq!(literal_branches(&json!({})), None);
+        // Glob scopes match live branches a probe cannot enumerate —
+        // never a provable dead scope.
+        assert_eq!(literal_branches(&detail(json!(["refs/heads/*"]))), None);
+        assert_eq!(
+            literal_branches(&detail(json!(["refs/heads/release/**"]))),
+            None
+        );
+        assert_eq!(literal_branches(&detail(json!(["refs/heads/a?"]))), None);
+        assert_eq!(literal_branches(&detail(json!(["refs/heads/x[y]"]))), None);
+        assert_eq!(literal_branches(&detail(json!(["refs/heads/"]))), None);
     }
 
     #[test]
@@ -1271,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_rulesets_selects_only_managed_and_undesired() {
+    fn stale_rows_selects_only_managed_and_undesired() {
         let list = vec![
             json!({"name": "clean-your-attribution", "id": 1}),
             json!({"name": "clean-your-attribution-check", "id": 2}),
@@ -1279,19 +1354,37 @@ mod tests {
             json!({"name": "someone-elses", "id": 4}),
             json!({"id": 5}),
         ];
+        let names = |rows: Vec<&serde_json::Value>| -> Vec<String> {
+            rows.iter()
+                .filter_map(|r| r.get("name").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        };
         let desired = desired_rulesets(false);
-        let stale = stale_rulesets(&list, &desired);
         assert_eq!(
-            stale,
+            names(stale_rows(&list, &desired)),
             [
-                ("clean-your-attribution-check", 2),
-                ("clean-your-attribution-default", 3)
+                "clean-your-attribution-check",
+                "clean-your-attribution-default"
             ]
         );
-        // A desired managed name is never stale, even mid-list.
+        // A desired managed name is never stale, even mid-list; a
+        // nameless row can never be selected.
         let desired = desired_rulesets(true);
-        assert!(stale_rulesets(&list, &desired)
-            .iter()
-            .all(|(n, _)| *n == "clean-your-attribution-default"));
+        assert_eq!(
+            names(stale_rows(&list, &desired)),
+            ["clean-your-attribution-default"]
+        );
+    }
+
+    #[test]
+    fn all_dead_requires_every_verdict_dead() {
+        use BranchVerdict::*;
+        assert!(all_dead([Dead].into_iter()));
+        assert!(all_dead([Dead, Dead, Dead].into_iter()));
+        assert!(!all_dead([Dead, Alive, Dead].into_iter()));
+        assert!(!all_dead([Dead, Unknown, Dead].into_iter()));
+        assert!(!all_dead([Alive].into_iter()));
+        assert!(!all_dead(std::iter::empty()));
     }
 }
