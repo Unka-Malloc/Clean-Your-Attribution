@@ -10,15 +10,17 @@
 //!
 //! Ruleset reconciliation is tiered by what the run can prove. A
 //! stale `-default` name duplicates the always-desired deny ruleset —
-//! provably redundant, removed unconditionally. A `check` ruleset whose
-//! scoped branches can no longer produce the check (named protected
-//! branches with no workflow yet, or a leftover -check whose every
-//! literal branch ref lost the file) is a self-installed deadlock —
-//! PUT `disabled` unconditionally, never deleted without `--prune`.
-//! Everything else stale — a `-protected` gate the operator stopped
-//! naming, a `-check` some branch still produces — keeps enforcing,
-//! is warned about and counted, and is deleted only under `--prune`,
-//! so a partial rerun can never silently strip gates it did not restate.
+//! removed under `--prune`, or without it only while this run installs
+//! an `active` deny successor, so a report-only rerun can never strip
+//! a live gate. A `check` ruleset whose scoped branches can no longer
+//! produce the check (named protected branches with no workflow yet,
+//! or a leftover `-check` whose every literal branch ref lost the
+//! file) is a self-installed deadlock — PUT `disabled` unconditionally,
+//! never deleted without `--prune`. Everything else stale — a
+//! `-protected` gate the operator stopped naming, a `-check` some
+//! branch still produces — keeps enforcing, is warned about and
+//! counted, and is deleted only under `--prune`, so a partial rerun
+//! can never silently strip gates it did not restate.
 //!
 //! Exit: 0 declared state landed; 1 repo failure(s); 3 stale tool-owned
 //! rulesets left (rerun with --prune); 2 usage/pre-flight error.
@@ -54,8 +56,10 @@ const RS_DENY: &str = "clean-your-attribution";
 const RS_TAGS: &str = "clean-your-attribution-tags";
 const RS_PROTECTED: &str = "clean-your-attribution-protected";
 const RS_CHECK: &str = "clean-your-attribution-check";
-/// The superseded pre-0.2.0 `~DEFAULT_BRANCH` ruleset — never desired,
-/// reconciled away under `--prune`.
+/// The superseded pre-0.2.0 `~DEFAULT_BRANCH` ruleset — never desired.
+/// Removed under `--prune`, or without it only while this run installs
+/// an `active` deny successor (otherwise it is a live gate the run
+/// must not strip); see `stale_action`.
 const RS_LEGACY_DEFAULT: &str = "clean-your-attribution-default";
 
 struct Args {
@@ -400,8 +404,8 @@ fn desired_rulesets(protected_named: bool) -> Vec<&'static str> {
 }
 
 /// Exit-code mapping, pure so the precedence is testable: real repo
-/// failures always dominate (1); a run that left stale tool-owned
-/// rulesets enforcing reports 3 (2 is this CLI's usage-error status);
+/// failures always dominate (1); a run that left undeclared tool-owned
+/// rulesets installed reports 3 (2 is this CLI's usage-error status);
 /// 0 means the declared state fully landed.
 fn apply_exit(failures: usize, stale_left: usize) -> i32 {
     if failures > 0 {
@@ -456,10 +460,25 @@ fn list_repos(args: &Args) -> Result<Vec<String>> {
 
 /// Fetches the workflow file as it exists on `git_ref` (None = the repo's
 /// default branch). A missing file is `None`; real API failures propagate.
+/// Minimal percent-encoding for a query value — `/` stays readable
+/// (branch names carry it constantly); anything else unusual is
+/// escaped so a ref can never break out of the parameter.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn workflow_file(owner: &str, repo: &str, git_ref: Option<&str>) -> Result<Option<Value>> {
     let mut path = format!("/repos/{owner}/{repo}/contents/{WORKFLOW_PATH}");
     if let Some(r) = git_ref {
-        path = format!("{path}?ref={r}");
+        path = format!("{path}?ref={}", urlencode(r));
     }
     match api("GET", &path, None) {
         Ok(v) if v.get("sha").and_then(Value::as_str).is_some() => Ok(Some(v)),
@@ -659,37 +678,90 @@ fn repo_owned(row: &Value) -> bool {
 /// no refs) can never silently strip gates it did not restate.
 /// Without `--prune` each stale ruleset is warned about and counted —
 /// the run's footer and exit code say enforcement was left behind.
-/// Whether a live `-check` ruleset can still produce the check it
-/// demands: reads its detail and asks each literal `refs/heads/<b>` in
-/// its include list for the workflow file. Only a ruleset whose every
-/// scoped branch lacks the file is a proven deadlock — symbolic
-/// patterns, an empty scope or an unreadable detail are not provable
-/// and leave it to the declared-set paths instead.
-fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Result<bool> {
-    let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None)?;
+/// The literal branch refs a `-check` ruleset detail declares in its
+/// include list. `None` when the scope is not provable from the payload
+/// alone — a symbolic pattern (`~ALL`, `~DEFAULT_BRANCH`), an empty
+/// include list, or a missing conditions block — so only an
+/// all-literal scope can ever be judged a deadlock.
+fn deadlock_branches(detail: &Value) -> Option<Vec<String>> {
     let includes = detail
-        .get("conditions")
-        .and_then(|c| c.get("ref_name"))
-        .and_then(|r| r.get("include"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut saw_literal = false;
-    for pattern in &includes {
-        let Some(text) = pattern.as_str() else {
-            return Ok(false);
-        };
-        let Some(branch) = text.strip_prefix("refs/heads/") else {
-            return Ok(false);
-        };
-        saw_literal = true;
-        if workflow_file(owner, repo, Some(branch))?.is_some() {
-            return Ok(false);
-        }
+        .get("conditions")?
+        .get("ref_name")?
+        .get("include")?
+        .as_array()?;
+    if includes.is_empty() {
+        return None;
     }
-    Ok(saw_literal)
+    let mut branches = Vec::with_capacity(includes.len());
+    for pattern in includes {
+        branches.push(pattern.as_str()?.strip_prefix("refs/heads/")?.to_string());
+    }
+    Some(branches)
 }
 
+/// What a reconcile run may do with one stale tool-owned ruleset — the
+/// destructive/disarming decision as a pure function so the tier
+/// boundary is executable specification, not folklore.
+#[derive(Debug, PartialEq, Eq)]
+enum StaleAction {
+    /// `--prune` always deletes; the superseded `-default` name may also
+    /// be deleted without it, but only when this run installs an
+    /// enforcing (`active`) deny successor — otherwise removal would
+    /// swap a live gate for a report-only duplicate.
+    Remove,
+    /// A `-check` whose scope provably cannot produce the check is a
+    /// deadlock, not enforcement — PUT it `disabled` without waiting
+    /// for `--prune` (deletion still needs the opt-in).
+    Disable,
+    /// Everything else keeps enforcing: warned, counted, exit 3.
+    Warn,
+}
+
+fn stale_action(name: &str, prune: bool, deny_enforcing: bool, deadlocked: bool) -> StaleAction {
+    if name == RS_LEGACY_DEFAULT {
+        return if prune || deny_enforcing {
+            StaleAction::Remove
+        } else {
+            StaleAction::Warn
+        };
+    }
+    if name == RS_CHECK && !prune && deadlocked {
+        return StaleAction::Disable;
+    }
+    if prune {
+        StaleAction::Remove
+    } else {
+        StaleAction::Warn
+    }
+}
+
+/// Probes whether a live `-check` ruleset is a proven deadlock: its
+/// scope is all-literal and no scoped branch carries the workflow file.
+/// Returns the scoped branch names when proven — `None` for anything
+/// not provable, including a detail or file read that fails, which the
+/// caller treats as "leave to the declared-set paths" rather than a
+/// repo failure.
+fn check_ruleset_deadlocks(owner: &str, repo: &str, id: i64) -> Option<Vec<String>> {
+    let detail = api("GET", &format!("/repos/{owner}/{repo}/rulesets/{id}"), None).ok()?;
+    let branches = deadlock_branches(&detail)?;
+    for branch in &branches {
+        match workflow_file(owner, repo, Some(branch)) {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(branches)
+}
+
+/// Reconciles a repo's ruleset listing against the declared set, tiered
+/// by what the run can prove: a `-default` ruleset is removed only when
+/// it is provably redundant (`--prune`, or an `active` deny successor
+/// this run installs); a `-check` whose scope provably cannot produce
+/// the check is disarmed to `disabled`; every other stale object keeps
+/// enforcing and is only deleted under `--prune`. Returns how many
+/// undeclared objects are left installed — warned or disarmed — for the
+/// footer and exit code.
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
@@ -697,48 +769,58 @@ fn reconcile_rulesets(
     desired: &[&str],
     dry_run: bool,
     prune: bool,
+    deny_enforcing: bool,
 ) -> Result<usize> {
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
     for (name, id) in stale_rulesets(list, desired) {
-        // The superseded `-default` name duplicates the always-desired
-        // deny ruleset — provably redundant, so removal needs no opt-in.
-        if name == RS_LEGACY_DEFAULT {
-            if dry_run {
-                println!("    ruleset {name}: would remove (superseded by {RS_DENY})");
-            } else {
-                api("DELETE", &format!("{base}/{id}"), None)?;
-                println!("    ruleset {name}: removed (superseded by {RS_DENY})");
-            }
-            continue;
-        }
-        // A `-check` no scoped branch can still satisfy is a self-
-        // installed deadlock, not enforcement — disarm it to `disabled`
-        // unconditionally. Deleting it still needs --prune, and a
-        // `-check` some branch still produces is merely stale: warned
-        // about, counted, and only removable under --prune.
-        if name == RS_CHECK && !prune && check_ruleset_deadlocks(owner, repo, id)? {
-            if dry_run {
-                println!(
-                    "    ruleset {name}: would disable (no scoped branch can produce the check)"
-                );
-            } else {
-                let mut body = api("GET", &format!("{base}/{id}"), None)?;
-                body["enforcement"] = json!("disabled");
-                api("PUT", &format!("{base}/{id}"), Some(&body))?;
-                println!("    ruleset {name}: disabled — no scoped branch carries the workflow (deadlock repaired; rerun with --prune to remove)");
-            }
-            left += 1;
-            continue;
-        }
-        if !prune {
-            left += 1;
-            println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
-        } else if dry_run {
-            println!("    ruleset {name}: would remove (stale)");
+        let deadlocked = if name == RS_CHECK && !prune {
+            check_ruleset_deadlocks(owner, repo, id)
         } else {
-            api("DELETE", &format!("{base}/{id}"), None)?;
-            println!("    ruleset {name}: removed (stale)");
+            None
+        };
+        match stale_action(name, prune, deny_enforcing, deadlocked.is_some()) {
+            StaleAction::Remove => {
+                let why = if name == RS_LEGACY_DEFAULT && !prune {
+                    format!("superseded by {RS_DENY}")
+                } else {
+                    "stale".to_string()
+                };
+                if dry_run {
+                    println!("    ruleset {name}: would remove ({why})");
+                } else {
+                    api("DELETE", &format!("{base}/{id}"), None)?;
+                    println!("    ruleset {name}: removed ({why})");
+                }
+            }
+            StaleAction::Disable => {
+                let branches = deadlocked.unwrap_or_default();
+                if dry_run {
+                    println!(
+                        "    ruleset {name}: would disable — no scoped branch \
+                         can produce the check ({})",
+                        branches.join(", ")
+                    );
+                } else {
+                    let refs: Vec<&str> = branches.iter().map(String::as_str).collect();
+                    api(
+                        "PUT",
+                        &format!("{base}/{id}"),
+                        Some(&ruleset_check("disabled", &refs)),
+                    )?;
+                    println!(
+                        "    ruleset {name}: disabled — scoped branches {} \
+                         cannot produce the check (deadlock repaired; \
+                         rerun with --prune to remove)",
+                        branches.join(", ")
+                    );
+                }
+                left += 1;
+            }
+            StaleAction::Warn => {
+                left += 1;
+                println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
+            }
         }
     }
     Ok(left)
@@ -900,11 +982,10 @@ pub fn run(argv: &[String]) -> Result<i32> {
                     println!("    check@{branch}: deferred until the workflow lands there");
                 }
             }
-            // Tool-owned rulesets outside the declared set are never
-            // deleted silently: without --prune they are warned about,
-            // with --prune the declared set is the whole story and each
-            // stale set is removed — including the superseded -default
-            // ruleset from pre-0.2.0 installs.
+            // Tiered reconcile — see reconcile_rulesets: a stale
+            // -default is deleted only when provably redundant, a
+            // deadlocked -check is disarmed, and every other stale
+            // object keeps enforcing until --prune deletes it.
             let stale_left = reconcile_rulesets(
                 owner,
                 repo,
@@ -912,6 +993,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 &desired_rulesets(!protect_refs.is_empty()),
                 args.dry_run,
                 args.prune,
+                args.enforcement == "active",
             )?;
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");
@@ -956,8 +1038,8 @@ pub fn run(argv: &[String]) -> Result<i32> {
     }
     if stale_left_total > 0 {
         println!(
-            "{stale_left_total} stale tool-owned ruleset(s) still enforcing — \
-             rerun with --prune to remove them"
+            "{stale_left_total} undeclared tool-owned ruleset(s) left installed \
+             (some disarmed, none deleted without --prune) — rerun with --prune"
         );
     }
     if !failures.is_empty() {
@@ -967,7 +1049,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
             failures.join(", ")
         );
     } else if stale_left_total > 0 {
-        println!("done (stale rulesets pending removal)");
+        println!("done (undeclared rulesets pending removal)");
     } else {
         println!("done");
     }
@@ -977,8 +1059,9 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exit, desired_rulesets, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
-        stale_rulesets, MANAGED_RULESETS,
+        apply_exit, deadlock_branches, desired_rulesets, repo_owned, ruleset_check,
+        ruleset_protected, ruleset_tags, stale_action, stale_rulesets, StaleAction,
+        MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -1060,6 +1143,67 @@ mod tests {
         // Failures dominate a stale remainder.
         assert_eq!(apply_exit(2, 4), 1);
         assert_eq!(apply_exit(1, 0), 1);
+    }
+
+    #[test]
+    fn stale_action_tiers() {
+        // -default: removed under --prune always; without it, only while
+        // the run installs an enforcing deny successor.
+        assert_eq!(
+            stale_action("clean-your-attribution-default", true, false, false),
+            StaleAction::Remove
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-default", false, true, false),
+            StaleAction::Remove
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-default", false, false, false),
+            StaleAction::Warn
+        );
+        // -check: --prune deletes; a proven deadlock disarms; anything
+        // else keeps enforcing and is warned about.
+        assert_eq!(
+            stale_action("clean-your-attribution-check", true, false, true),
+            StaleAction::Remove
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-check", false, false, true),
+            StaleAction::Disable
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-check", false, false, false),
+            StaleAction::Warn
+        );
+        // -protected is never auto-touched.
+        assert_eq!(
+            stale_action("clean-your-attribution-protected", false, true, true),
+            StaleAction::Warn
+        );
+        assert_eq!(
+            stale_action("clean-your-attribution-protected", true, true, true),
+            StaleAction::Remove
+        );
+    }
+
+    #[test]
+    fn deadlock_branches_reads_only_all_literal_scopes() {
+        let detail =
+            |include: serde_json::Value| json!({"conditions": {"ref_name": {"include": include}}});
+        assert_eq!(
+            deadlock_branches(&detail(json!(["refs/heads/a", "refs/heads/b"]))),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // A symbolic pattern, an empty include, a non-string entry or a
+        // missing conditions block are all unprovable — never a deadlock.
+        assert_eq!(deadlock_branches(&detail(json!(["~DEFAULT_BRANCH"]))), None);
+        assert_eq!(
+            deadlock_branches(&detail(json!(["refs/heads/a", "~ALL"]))),
+            None
+        );
+        assert_eq!(deadlock_branches(&detail(json!([]))), None);
+        assert_eq!(deadlock_branches(&detail(json!([42]))), None);
+        assert_eq!(deadlock_branches(&json!({})), None);
     }
 
     #[test]

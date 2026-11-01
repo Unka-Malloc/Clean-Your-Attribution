@@ -23,6 +23,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # The only repository whose pre-publication runs may fall back to a
+  # HEAD build — every consumer fails closed on an unresolvable index.
+  # A fixed literal on purpose: a consumer-settable variable would let
+  # a fork enable the fallback.
+  CYA_UPSTREAM: Unka-Malloc/Clean-Your-Attribution
+
 jobs:
   scan:
     name: attribution scan
@@ -73,10 +80,11 @@ jobs:
           # Every index record is judged: yanked entries are dropped and
           # the maximum semver wins — releases outrank prereleases and
           # prerelease identifiers compare numeric-then-lexical — so a
-          # backported patch cannot steal the pin. The curl failure is
-          # tolerated on purpose (`|| true`): an unresolvable index emits
-          # an empty version, which is the provisioning step's explicit
-          # unreleased/fail-closed path, not a dead run.
+          # backported patch cannot steal the pin. A failed fetch is
+          # absorbed into an empty version (not a dead run); this step
+          # then fails closed for consumer repositories, while upstream's
+          # own pre-publication runs continue to the HEAD build in the
+          # provisioning step.
           if ! index="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
             https://index.crates.io/cl/ea/clean-your-attribution)"; then
             echo "index fetch failed — resolving an empty version"
@@ -108,7 +116,7 @@ jobs:
           # A consumer fails closed here, before any cache restore or
           # compile spends runner time: only this repository's own
           # pre-publication runs may continue to the HEAD build.
-          if [ -z "$ver" ] && [ "${{ github.repository }}" != "Unka-Malloc/Clean-Your-Attribution" ]; then
+          if [ -z "$ver" ] && [ "$GITHUB_REPOSITORY" != "$CYA_UPSTREAM" ]; then
             echo "cya version unresolvable — the crates.io index is unreachable or names no usable release; failing closed" >&2
             exit 1
           fi
@@ -143,17 +151,12 @@ jobs:
           if [ -x ~/.cargo/bin/cya ]; then
             echo "cached cya $CYA_VERSION"
           elif [ -z "$CYA_VERSION" ]; then
-            if [ "${{ github.repository }}" = "Unka-Malloc/Clean-Your-Attribution" ]; then
-              # Unreleased path: the index could not name a version —
-              # only this repository's own pre-publication runs may
-              # build HEAD; a consumer never floats off its pin.
-              echo "no published version resolved — building unreleased HEAD from source"
-              cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
-                --locked --bin cya
-            else
-              echo "cya version unresolvable — the crates.io index is unreachable or names no usable release; failing closed" >&2
-              exit 1
-            fi
+            # Unreleased path: the index could not name a version. The
+            # resolve step already fails closed for consumers — only
+            # upstream's own pre-publication runs reach this branch.
+            echo "no published version resolved — building unreleased HEAD from source"
+            cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
+              --locked --bin cya
           elif ! cargo install "clean-your-attribution@${CYA_VERSION}" \
                 --locked --bin cya; then
             # Pre-release fallback: the same version's tag, never a

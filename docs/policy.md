@@ -126,7 +126,9 @@ covered.
 `cya apply` installs a repo-wide set plus a branch-scoped set, each
 explicitly named at install time. Enforcement declared by an earlier
 run persists until `--prune` removes it — a run never silently widens
-or narrows what an operator previously named:
+or narrows what an operator previously named, except the two provable
+repairs described below (the redundant `-default` and a deadlocked
+`-check`):
 
 - **Repo-wide** (`--repos`, `--orgs`, `--users`): the `~ALL` deny
   ruleset, the `~ALL`-tags admin restriction, and squash-only merge
@@ -149,20 +151,22 @@ or narrows what an operator previously named:
   without the file stays out of its scope.
 
 Reconciliation is tiered by what a run can prove. Two repairs are
-unconditional because they are not declaration questions: the
-superseded pre-0.2.0 `clean-your-attribution-default` ruleset
-duplicates the always-installed deny ruleset and is deleted outright,
-and a `check` ruleset whose every scoped branch lacks the workflow —
+unconditional because they are not declaration questions — and both
+are bounded so they can never weaken real enforcement: the superseded
+pre-0.2.0 `clean-your-attribution-default` ruleset is deleted under
+`--prune`, or without it only while the run installs an `active` deny
+successor (a report-only rerun leaves it warned, not removed); and a
+`check` ruleset whose every literal scoped branch lacks the workflow —
 a deadlock, since it demands a check that cannot run — is PUT
-`disabled`. Everything else stale keeps enforcing and is *warned*
-about and counted — the run footer names the leftover and the exit
-code reports it: a `-check` gate a run no longer names while some
-scoped branch still produces the check, or a `protected` set the
-operator stopped naming. With `--prune` those leftovers are deleted
-and each removal printed. A partial rerun — a policy refresh naming
-no refs — can therefore never silently strip gates it did not
-restate; only `includes_parents=false` repo-owned rulesets are ever
-in scope.
+`disabled` (deleting it still needs `--prune`). Everything else stale
+keeps enforcing and is *warned* about and counted — the run footer
+names the leftover and the exit code reports it: a `-check` gate a run
+no longer names while some scoped branch still produces the check, or
+a `protected` set the operator stopped naming. With `--prune` those
+leftovers are deleted and each removal printed. A partial rerun — a
+policy refresh naming no refs — can therefore never silently strip
+gates it did not restate; only `includes_parents=false` repo-owned
+rulesets are ever in scope.
 
 Exit codes: `0` the declared state fully landed; `1` one or more repos
 failed; `3` the run succeeded but left stale tool-owned rulesets —

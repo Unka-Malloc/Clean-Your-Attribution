@@ -144,17 +144,17 @@ through your normal path and rerun `cya apply`. Repos named by either
 flag join the rollout automatically; a repo with neither gets the
 deny/tag rulesets and merge settings only.
 
-A run repairs only what it can prove: the superseded
-`clean-your-attribution-default` ruleset duplicates the always-installed
-deny set and is removed unconditionally, and a check ruleset whose
-scoped branches can no longer produce the check is a deadlock — PUT
-`disabled` at once, never deleted without `--prune`. Everything else
-stale (a `-protected` or `-check` gate a run no longer names while it
-still works) keeps enforcing, is reported `stale`, counted in the
-footer and surfaced as exit code 3 until `--prune` deletes it — so a
-partial rerun can never silently strip gates. Exit codes: `0` clean,
-`1` repo failure(s), `3` stale rulesets left, `2` usage/pre-flight
-error.
+A run repairs only what it can prove, and never weakens a live gate:
+the superseded `clean-your-attribution-default` ruleset is deleted
+under `--prune`, or without it only while the run installs an `active`
+deny successor; a check ruleset whose scoped branches can no longer
+produce the check is a deadlock — PUT `disabled` at once, never
+deleted without `--prune`. Everything else stale (a `-protected` or
+`-check` gate a run no longer names while it still works) keeps
+enforcing, is reported `stale`, counted in the footer and surfaced as
+exit code 3 until `--prune` deletes it — so a partial rerun can never
+silently strip gates. Exit codes: `0` clean, `1` repo failure(s),
+`3` undeclared rulesets left, `2` usage/pre-flight error.
 
 Credentials come from `GITHUB_TOKEN` if set, else `gh api` (any `gh`
 with GitHub API access — the GitHub CLI or a compatible shim).
