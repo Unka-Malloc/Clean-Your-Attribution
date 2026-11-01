@@ -116,7 +116,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         }
         Ok(pairs)
     };
-    Ok(Args {
+    let args = Args {
         orgs: list("--orgs"),
         users: list("--users"),
         repos: list("--repos"),
@@ -127,7 +127,39 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         include_private: argv.iter().any(|a| a == "--include-private"),
         prune: argv.iter().any(|a| a == "--prune"),
         dry_run: argv.iter().any(|a| a == "--dry-run"),
-    })
+    };
+    // The protected object must not carry its own protection controls:
+    // naming this tool's publishing repository as a rollout target is a
+    // usage error — its rulesets, check workflow and merge settings are
+    // administered by the operator outside the checkout the tool ships
+    // from.
+    anyhow::ensure!(
+        !args.repos.iter().any(|repo| is_self_repo(repo))
+            && !args
+                .install_refs
+                .iter()
+                .chain(args.protect_refs.iter())
+                .any(|(repo, _)| is_self_repo(repo)),
+        "cya apply must not target {} — its protection surface is \
+         administered outside the protected checkout",
+        self_repo_slug().unwrap_or_default(),
+    );
+    Ok(args)
+}
+
+/// The repository this build publishes. `CARGO_PKG_REPOSITORY` names the
+/// origin, so a downstream build of this source guards its own publishing
+/// repo rather than borrowing this one's identity.
+fn self_repo_slug() -> Option<String> {
+    let rest = env!("CARGO_PKG_REPOSITORY").strip_prefix("https://github.com/")?;
+    let slug = rest.trim_end_matches(".git").trim_end_matches('/');
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// A repo target naming this tool's own publishing repository, matched
+/// case-insensitively the way GitHub resolves slugs.
+fn is_self_repo(slug: &str) -> bool {
+    self_repo_slug().is_some_and(|own| slug.eq_ignore_ascii_case(&own))
 }
 
 // ------------------------------------------------------------------ api --
@@ -1018,6 +1050,16 @@ pub fn run(argv: &[String]) -> Result<i32> {
     let mut pending = Vec::new();
     let mut stale_left_total = 0usize;
     for full in &repos {
+        // An organization or user sweep can enumerate this tool's own
+        // repository without ever naming it: the protected object is
+        // excluded from its own rollout — reported, never a failure.
+        if is_self_repo(full) {
+            println!(
+                "  {full}: skipped — this tool's own repository is administered \
+                 outside the protected checkout"
+            );
+            continue;
+        }
         let (owner, repo) = full
             .split_once('/')
             .context(format!("bad repo name {full}"))?;
@@ -1225,12 +1267,43 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dead, apply_exit, desired_rulesets, gh_http_status, http_outcome, literal_branches,
-        probe_needed, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
-        split_http_status, stale_action, stale_rows, urlencode, BranchVerdict, HttpOutcome,
-        StaleAction, MANAGED_RULESETS,
+        all_dead, apply_exit, desired_rulesets, gh_http_status, http_outcome, is_self_repo,
+        literal_branches, parse_args, probe_needed, repo_owned, ruleset_check, ruleset_protected,
+        ruleset_tags, self_repo_slug, split_http_status, stale_action, stale_rows, urlencode,
+        BranchVerdict, HttpOutcome, StaleAction, MANAGED_RULESETS,
     };
     use serde_json::json;
+
+    /// The protected object must not carry its own protection controls:
+    /// an explicit `--repos`, `--install-refs` or `--protect-refs` entry
+    /// naming the repository this build publishes is refused as a usage
+    /// error, whatever case the slug arrives in — while any other
+    /// repository stays admissible.
+    #[test]
+    fn the_publishing_repo_is_not_a_rollout_target() {
+        let own = self_repo_slug().expect("the package names its repository");
+        assert!(is_self_repo(&own));
+        assert!(
+            is_self_repo(&own.to_uppercase()),
+            "GitHub resolves slugs case-insensitively"
+        );
+        assert!(!is_self_repo("other/repo"));
+        for argv in [
+            vec!["--repos".to_string(), own.clone()],
+            vec!["--install-refs".to_string(), format!("{own}:main")],
+            vec!["--protect-refs".to_string(), format!("{own}:main")],
+            vec![
+                "--repos".to_string(),
+                format!("other/repo,{}", own.to_lowercase()),
+            ],
+        ] {
+            assert!(
+                parse_args(&argv).is_err(),
+                "an explicit self-target must refuse: {argv:?}"
+            );
+        }
+        assert!(parse_args(&["--repos".to_string(), "other/repo".to_string()]).is_ok());
+    }
 
     #[test]
     fn protection_rulesets_scope_only_named_branches() {
