@@ -162,6 +162,36 @@ fn is_self_repo(slug: &str) -> bool {
     self_repo_slug().is_some_and(|own| slug.eq_ignore_ascii_case(&own))
 }
 
+/// The server's canonical `full_name` for a spelled target decides
+/// identity — whatever normalization the transport or server applied.
+fn canonical_self(meta: &Value) -> bool {
+    meta.get("full_name")
+        .and_then(Value::as_str)
+        .is_some_and(is_self_repo)
+}
+
+/// Split an `owner/repo` target into the two URL-bound segments. Anything
+/// beyond GitHub's own character set — a second `/`, a `.`/`..` segment,
+/// a percent escape, a `.git` suffix the server folds — is refused: the
+/// spelled name is exactly the target or the run stops, so normalization
+/// can never redirect a write past the self-protection guard.
+fn repo_slug_parts(slug: &str) -> Result<(&str, &str)> {
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    let msg = format!("bad repo name {slug} — targets resolve as spelled or not at all");
+    let (owner, repo) = slug.split_once('/').context(msg.clone())?;
+    anyhow::ensure!(
+        segment_ok(owner) && segment_ok(repo) && !repo.to_ascii_lowercase().ends_with(".git"),
+        "{msg}"
+    );
+    Ok((owner, repo))
+}
+
 // ------------------------------------------------------------------ api --
 
 fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -1060,10 +1090,20 @@ pub fn run(argv: &[String]) -> Result<i32> {
             );
             continue;
         }
-        let (owner, repo) = full
-            .split_once('/')
-            .context(format!("bad repo name {full}"))?;
+        let (owner, repo) = repo_slug_parts(full)?;
         let meta = api("GET", &format!("/repos/{owner}/{repo}"), None)?;
+        // A spelled target can normalize to a different repository than
+        // the string guard checked — `unused/../` folded by curl, a
+        // `.git` suffix stripped by the server. The response's canonical
+        // identity is the authoritative answer: whatever the spelled
+        // shape, writes never land on the protected object.
+        if canonical_self(&meta) {
+            println!(
+                "  {full}: skipped — resolves to this tool's own repository \
+                 (administered outside the protected checkout)"
+            );
+            continue;
+        }
         if meta["private"].as_bool().unwrap_or(false) && !args.include_private {
             println!("  {full}: skipped (private — server-side enforcement needs a paid plan)");
             continue;
@@ -1267,10 +1307,11 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dead, apply_exit, desired_rulesets, gh_http_status, http_outcome, is_self_repo,
-        literal_branches, parse_args, probe_needed, repo_owned, ruleset_check, ruleset_protected,
-        ruleset_tags, self_repo_slug, split_http_status, stale_action, stale_rows, urlencode,
-        BranchVerdict, HttpOutcome, StaleAction, MANAGED_RULESETS,
+        all_dead, apply_exit, canonical_self, desired_rulesets, gh_http_status, http_outcome,
+        is_self_repo, literal_branches, parse_args, probe_needed, repo_owned, repo_slug_parts,
+        ruleset_check, ruleset_protected, ruleset_tags, self_repo_slug, split_http_status,
+        stale_action, stale_rows, urlencode, BranchVerdict, HttpOutcome, StaleAction,
+        MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -1303,6 +1344,55 @@ mod tests {
             );
         }
         assert!(parse_args(&["--repos".to_string(), "other/repo".to_string()]).is_ok());
+    }
+
+    /// A spelled target is exactly the repository it names: segments the
+    /// transport or server could fold — `..`, `.`, an extra `/`, percent
+    /// escapes, a `.git` suffix — are refused rather than re-spelled, so
+    /// normalization cannot redirect a write onto the protected object
+    /// the string guard compared.
+    #[test]
+    fn repo_targets_resolve_as_spelled_or_refuse() {
+        for (slug, ok) in [
+            ("Unka-Malloc/Clean-Your-Attribution", true),
+            ("o/r_1.x-y", true),
+            ("Unka-Malloc/unused/../Clean-Your-Attribution", false),
+            ("o/./r", false),
+            ("o/../r", false),
+            ("o/r/s", false),
+            ("o/r%2e%2e", false),
+            ("o%2f/r", false),
+            ("o/r.git", false),
+            ("o/r.GIT", false),
+            ("o/", false),
+            ("/r", false),
+            ("o r/r", false),
+            ("orr", false),
+        ] {
+            assert_eq!(repo_slug_parts(slug).is_ok(), ok, "slug {slug:?}");
+        }
+        let own = self_repo_slug().expect("the package names its repository");
+        assert!(
+            repo_slug_parts("other/repo").is_ok()
+                && repo_slug_parts(&format!("x/../{own}")).is_err(),
+            "a folded self-target must refuse before the guard compares"
+        );
+    }
+
+    /// The server's resolved `full_name` is the identity check that no
+    /// spelled shape can pass: whatever normalization produced it, a
+    /// target that lands on the publishing repository is skipped before
+    /// any mutation.
+    #[test]
+    fn canonical_identity_decides_self_regardless_of_spelling() {
+        let own = self_repo_slug().expect("the package names its repository");
+        assert!(canonical_self(&json!({ "full_name": own })));
+        assert!(
+            canonical_self(&json!({ "full_name": own.to_uppercase() })),
+            "GitHub resolves slugs case-insensitively"
+        );
+        assert!(!canonical_self(&json!({ "full_name": "other/repo" })));
+        assert!(!canonical_self(&json!({})));
     }
 
     #[test]
