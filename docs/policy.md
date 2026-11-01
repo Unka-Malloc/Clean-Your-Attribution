@@ -165,10 +165,11 @@ keeps enforcing and is *warned* about and counted — the run footer
 names the leftover and the exit code reports it: a `-check` gate a run
 no longer names while some scoped branch still produces the check, or
 a `protected` set the operator stopped naming while its scoped
-branches still exist. A leftover that is already `disabled` is
-reported as such and still counted (exit 3) until `--prune` removes
-it, but the run issues no probes and no write for it. With `--prune`
-those leftovers are deleted and each removal printed. A partial rerun — a policy refresh naming no
+branches still exist. A stale `-check`/`-protected` leftover that is
+already `disabled` is reported as such and still counted (exit 3)
+until `--prune` removes it, but the run issues no probes and no
+write for it. With `--prune` those leftovers are deleted and each
+removal printed. A partial rerun — a policy refresh naming no
 refs — can therefore never silently strip a *live* gate it did not
 restate; only `includes_parents=false` repo-owned rulesets are ever
 in scope.

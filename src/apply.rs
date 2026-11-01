@@ -20,7 +20,9 @@
 //! naming, a `-check` some branch still produces — keeps enforcing,
 //! is warned about and counted, and is deleted only under `--prune`,
 //! so a partial rerun can never silently strip gates it did not
-//! restate.
+//! restate. A stale `-check`/`-protected` found already `disabled`
+//! is reported and counted the same way, but costs no probes and no
+//! write.
 //!
 //! Exit: 0 declared state landed; 1 repo failure(s); 3 stale tool-owned
 //! rulesets left (rerun with --prune); 2 usage/pre-flight error.
@@ -250,7 +252,9 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
     // curl success ≠ API success — classify on the real status line, not
-    // on prose. 404/410 is the only provable "object is gone" answer.
+    // on prose. Only 2xx is data: 404/410 is the provable "object is
+    // gone" answer, and anything else — redirects included, curl runs
+    // without -L — fails closed as a transport error.
     let (status, body_text) = split_http_status(&text);
     if status == 404 || status == 410 {
         return Err(ApiNotFound {
@@ -258,7 +262,7 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         }
         .into());
     }
-    if status >= 400 {
+    if !(200..=299).contains(&status) {
         let msg = serde_json::from_str::<Value>(body_text)
             .ok()
             .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
@@ -515,8 +519,6 @@ fn list_repos(args: &Args) -> Result<Vec<String>> {
     Ok(named)
 }
 
-/// Fetches the workflow file as it exists on `git_ref` (None = the repo's
-/// default branch). A missing file is `None`; real API failures propagate.
 /// The API path for a branch's git ref — one place so the existence
 /// check and the dead-gate probe can never disagree about escaping.
 fn branch_ref_path(owner: &str, repo: &str, branch: &str) -> String {
@@ -538,6 +540,10 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
+/// Fetches the workflow file as it exists on `git_ref` (None = the repo's
+/// default branch). A missing file (a real 404/410, nothing else) is
+/// `None`; every other API failure propagates so a transient error can
+/// never masquerade as "file absent".
 fn workflow_file(owner: &str, repo: &str, git_ref: Option<&str>) -> Result<Option<Value>> {
     let mut path = format!("/repos/{owner}/{repo}/contents/{WORKFLOW_PATH}");
     if let Some(r) = git_ref {
@@ -713,16 +719,15 @@ fn ensure_ruleset(
 
 /// The managed-but-undesired rows in a ruleset listing: what `--prune`
 /// deletes and what a plain run warns about or disarms. Pure — the
-/// selection is testable without touching the API. Admissible rows
-/// carry both a managed `name` and an integer `id`: a partial row can
-/// never be turned into a request against a fabricated identifier.
+/// selection is testable without touching the API. Every row a managed
+/// `name` makes admissible is kept for accounting; a row without a
+/// usable `id` is reported rather than silently dropped, and can never
+/// be turned into a request against a fabricated identifier.
 fn stale_rows<'a>(list: &'a [Value], desired: &[&str]) -> Vec<&'a Value> {
     list.iter()
         .filter(|row| {
             let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
-            MANAGED_RULESETS.contains(&name)
-                && !desired.contains(&name)
-                && row.get("id").and_then(Value::as_i64).is_some()
+            MANAGED_RULESETS.contains(&name) && !desired.contains(&name)
         })
         .collect()
 }
@@ -783,12 +788,19 @@ enum StaleAction {
     Warn,
 }
 
-/// Whether a dead-gate probe is worth its API calls at all: only the
-/// two branch-scoped gate kinds can die, never under `--prune` (they
-/// are deleted outright), and never for a gate already `disabled` —
-/// reaching a state that is in place would spend requests for nothing.
+/// The two managed names whose rulesets are scoped to literal branches —
+/// the only kinds that can go provably dead. One definition feeds the
+/// probe gate, the action classifier and the reconcile match.
+fn branch_scoped_gate(name: &str) -> bool {
+    matches!(name, RS_CHECK | RS_PROTECTED)
+}
+
+/// Whether a dead-gate probe is worth its API calls at all: only
+/// branch-scoped gates can die, never under `--prune` (they are deleted
+/// outright), and never for a gate already `disabled` — reaching a
+/// state that is in place would spend requests for nothing.
 fn probe_needed(name: &str, prune: bool, already_disabled: bool) -> bool {
-    !prune && !already_disabled && matches!(name, RS_CHECK | RS_PROTECTED)
+    !prune && !already_disabled && branch_scoped_gate(name)
 }
 
 fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bool) -> StaleAction {
@@ -799,7 +811,7 @@ fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bo
             StaleAction::Warn
         };
     }
-    if !prune && provably_dead && matches!(name, RS_CHECK | RS_PROTECTED) {
+    if !prune && provably_dead && branch_scoped_gate(name) {
         return StaleAction::Disable;
     }
     if prune {
@@ -869,12 +881,13 @@ fn reconcile_rulesets(
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
     for row in stale_rows(list, desired) {
-        let (Some(name), Some(id)) = (
-            row.get("name").and_then(Value::as_str),
-            row.get("id").and_then(Value::as_i64),
-        ) else {
-            // Unreachable in practice — the selector admits only rows
-            // carrying both — but never fabricate an identifier.
+        let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
+        let Some(id) = row.get("id").and_then(Value::as_i64) else {
+            // A managed name without a usable id cannot be addressed by
+            // the API — report it and count it rather than silently
+            // dropping a possibly-still-enforcing gate.
+            println!("  ruleset {name}: stale — malformed listing row (no usable id), cannot be reconciled");
+            left += 1;
             continue;
         };
         // An already-disabled gate needs neither probes nor a PUT: it is
@@ -1355,6 +1368,7 @@ mod tests {
         assert_eq!(split_http_status("\n204"), (204, ""));
         assert_eq!(split_http_status("{}\n404"), (404, "{}"));
         assert_eq!(split_http_status("{}\n410"), (410, "{}"));
+        assert_eq!(split_http_status("{}\n301"), (301, "{}"));
         assert_eq!(split_http_status("{}\n403"), (403, "{}"));
         assert_eq!(split_http_status("{}\n502"), (502, "{}"));
         // Absent or unparseable markers classify as 0 — never NotFound.
@@ -1422,6 +1436,10 @@ mod tests {
             json!({"name": "clean-your-attribution-default", "id": 3}),
             json!({"name": "someone-elses", "id": 4}),
             json!({"id": 5}),
+            // A managed name without an id stays in the accounting —
+            // the loop reports it rather than silently dropping a
+            // possibly-still-enforcing gate.
+            json!({"name": "clean-your-attribution-protected"}),
         ];
         let names = |rows: Vec<&serde_json::Value>| -> Vec<String> {
             rows.iter()
@@ -1434,7 +1452,8 @@ mod tests {
             names(stale_rows(&list, &desired)),
             [
                 "clean-your-attribution-check",
-                "clean-your-attribution-default"
+                "clean-your-attribution-default",
+                "clean-your-attribution-protected"
             ]
         );
         // A desired managed name is never stale, even mid-list; a
