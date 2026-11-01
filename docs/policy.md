@@ -141,12 +141,16 @@ explicitly named — nothing is scoped implicitly:
   apply run once the file lands, never before: requiring a check no
   branch produces would deadlock the merge meant to carry the file in.
 
-Reconciliation closes the loop: on every run the repo's tool-owned
-rulesets are compared against the declared set, and any managed ruleset
-outside it is deleted — a `check` gate whose last file-carrying branch
-is gone, a `protected` set the operator stopped naming, and the
-superseded pre-0.2.0 `clean-your-attribution-default` ruleset. Each
-removal is printed; nothing tool-owned survives unnamed.
+Reconciliation is explicit opt-in: a run creates and updates only, and
+every tool-owned ruleset outside the declared set is *warned* about
+(`stale — rerun with --prune`). With `--prune`, the declared set is the
+whole story — each stale managed ruleset is deleted and the removal
+printed: a `check` gate whose named branches no longer carry the file,
+a `protected` set the operator stopped naming, and the superseded
+pre-0.2.0 `clean-your-attribution-default` ruleset. A partial rerun —
+a policy refresh naming no refs — can therefore never silently strip
+gates it did not restate; only `includes_parents=false` repo-owned
+rulesets are ever in scope.
 
 ## Resolution order
 

@@ -5,9 +5,12 @@ name: clean-your-attribution
 #   ruleset "Require workflows to pass" rule — no per-repo caller needed.
 # - workflow_call: can be reused by a thin caller file in repositories where
 #   ruleset workflow references are unavailable.
-# The cya binary is provisioned from the published crates.io package —
-# registry-resolved and lockfile-pinned — with `cargo install --git` as
-# the pre-release fallback. The policy travels inside the binary.
+# The cya binary is provisioned from the published crates.io package,
+# pinned to the version the sparse index resolves for this run (logged —
+# "what scanned this commit" is answerable from the run output) and built
+# --locked, with a tag-pinned `cargo install --git` as the pre-release
+# fallback. The resolved binary is cached per version, so warm runs skip
+# the compile entirely. The policy travels inside the binary.
 
 on:
   workflow_call:
@@ -68,21 +71,41 @@ jobs:
           key: cya-cargo-${{ runner.os }}-${{ runner.arch }}
           restore-keys: cya-cargo-
 
+      - name: Resolve the published cya version
+        id: cya-version
+        run: |
+          set -e
+          # The same sparse index cargo reads: last record is the latest
+          # published version — the run's pin and cache key.
+          ver="$(curl -fsSL https://index.crates.io/cl/ea/clean-your-attribution \
+            | tail -n1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["vers"])')"
+          echo "resolved cya $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the cya binary
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cya
+          key: cya-bin-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Provision cya
         run: |
           set -e
-          # The published crate is the pinned path — the registry resolves
-          # the version and --locked keeps its shipped lockfile. --git is
-          # the pre-release fallback for unreleased revisions.
-          if ! cargo install clean-your-attribution --locked \
-                --root "$RUNNER_TEMP/cya-home" --bin cya; then
+          if [ -x ~/.cargo/bin/cya ]; then
+            echo "cached cya ${{ steps.cya-version.outputs.version }}"
+          elif ! cargo install "clean-your-attribution@${{ steps.cya-version.outputs.version }}" \
+                --locked --bin cya; then
+            # Pre-release fallback: the same version's tag, never a
+            # floating HEAD — a run of an unreleased tree says so.
+            echo "registry install failed — building tag v${{ steps.cya-version.outputs.version }} from source"
             cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
-              --locked --root "$RUNNER_TEMP/cya-home" --bin cya
+              --tag "v${{ steps.cya-version.outputs.version }}" \
+              --locked --bin cya
           fi
-          "$RUNNER_TEMP/cya-home/bin/cya" policy --check
+          ~/.cargo/bin/cya policy --check
 
       - name: Scan commit range
-        run: "$RUNNER_TEMP/cya-home/bin/cya" scan --range "${{ steps.range.outputs.range }}"
+        run: ~/.cargo/bin/cya scan --range "${{ steps.range.outputs.range }}"
 
       - name: Scan pull request title and body
         if: github.event_name == 'pull_request'
@@ -90,4 +113,4 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | "$RUNNER_TEMP/cya-home/bin/cya" scan --stdin
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | ~/.cargo/bin/cya scan --stdin

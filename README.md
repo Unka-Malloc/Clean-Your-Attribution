@@ -83,8 +83,9 @@ an `--enforcement evaluate` staging run must not silently reopen tag
 writes while the workflow skips them; only `disabled` turns it off.
 
 The workflow provisions the `cya` binary from the published crates.io
-package (`cargo install --locked`, registry-resolved and reproducible),
-falling back to `cargo install --git` for unreleased revisions.
+package — the resolved version is pinned and logged per run, the build
+is `--locked`, and the compiled binary is cached per version; a
+tag-pinned `cargo install --git` is the only fallback.
 
 `cya apply` rolls all of that out across organizations and accounts:
 
@@ -135,6 +136,12 @@ carry the file in. Branches still waiting are reported pending: land the
 file through your normal path and rerun `cya apply`. Repos named by
 either flag join the rollout automatically; a repo with neither gets the
 deny/tag rulesets and merge settings only.
+
+A run creates and updates — it never deletes. Tool-owned rulesets
+outside the declared set (a branch the operator stopped naming, the
+superseded `clean-your-attribution-default` ruleset) are reported
+`stale` until `--prune` is given, which deletes each one and prints the
+removal — so a partial rerun can never silently strip gates.
 
 Credentials come from `GITHUB_TOKEN` if set, else `gh api` (any `gh`
 with GitHub API access — the GitHub CLI or a compatible shim).

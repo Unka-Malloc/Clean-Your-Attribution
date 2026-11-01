@@ -5,7 +5,14 @@
 //!   cya apply --orgs ORG1,ORG2 --users OWNER \
 //!     [--enforcement evaluate|active|disabled] [--include-private] \
 //!     [--repos o/r,...] [--install-refs o/r:BRANCH,..] \
-//!     [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] [--dry-run]
+//!     [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] \
+//!     [--prune] [--dry-run]
+//!
+//! The declared set is created and updated only: a run never deletes a
+//! ruleset unless `--prune` is given, under which every tool-owned
+//! ruleset outside the declared set (stale `-protected`/`-check`, the
+//! superseded `-default` name) is deleted and each removal printed.
+//! Without `--prune` the same stale objects are warned about instead.
 //!
 //! The tool never opens branches or pull requests and never guesses where
 //! anything belongs: `--install-refs` names (repo, branch) pairs that get
@@ -18,10 +25,9 @@
 //! protected branches is the operator's own pipeline, not this tool's
 //! behavior.
 //!
-//! Credentials: `GITHUB_TOKEN` if set — sent to api.github.com by curl
-//! with the Authorization header read from a private temp file — else
-//! ambient `gh` auth via `gh api` (the GitHub CLI or a compatible shim).
-//! No credential ever enters argv on either path.
+//! Credentials: `GITHUB_TOKEN` if set — piped to curl's stdin config,
+//! never in argv or a file — else ambient `gh` auth via `gh api` (the
+//! GitHub CLI or a compatible shim).
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -35,6 +41,14 @@ const WORKFLOW_PATH: &str = ".github/workflows/clean-your-attribution.yml";
 const CHECK_CONTEXT: &str = "clean-your-attribution / attribution scan";
 const ACTIONS_INTEGRATION_ID: i64 = 15368;
 
+const RS_DENY: &str = "clean-your-attribution";
+const RS_TAGS: &str = "clean-your-attribution-tags";
+const RS_PROTECTED: &str = "clean-your-attribution-protected";
+const RS_CHECK: &str = "clean-your-attribution-check";
+/// The superseded pre-0.2.0 `~DEFAULT_BRANCH` ruleset — never desired,
+/// reconciled away under `--prune`.
+const RS_LEGACY_DEFAULT: &str = "clean-your-attribution-default";
+
 struct Args {
     orgs: Vec<String>,
     users: Vec<String>,
@@ -44,6 +58,7 @@ struct Args {
     protect_refs: Vec<(String, String)>,
     local_refs: Vec<(String, String)>,
     include_private: bool,
+    prune: bool,
     dry_run: bool,
 }
 
@@ -70,7 +85,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         "--enforcement must be evaluate|active|disabled"
     );
     if argv.is_empty() || argv.iter().any(|a| a == "--help") {
-        bail!("usage: cya apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--install-refs o/r:BRANCH,..] [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] [--include-private] [--dry-run]");
+        bail!("usage: cya apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--install-refs o/r:BRANCH,..] [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] [--include-private] [--prune] [--dry-run]");
     }
     let combos = |flag: &str, require_slash: bool| -> Result<Vec<(String, String)>> {
         let mut pairs = Vec::new();
@@ -95,6 +110,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         protect_refs: combos("--protect-refs", true)?,
         local_refs: combos("--local", false)?,
         include_private: argv.iter().any(|a| a == "--include-private"),
+        prune: argv.iter().any(|a| a == "--prune"),
         dry_run: argv.iter().any(|a| a == "--dry-run"),
     })
 }
@@ -138,37 +154,17 @@ impl Drop for TempDir {
 
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
-    // The credential never enters argv: curl -H @file reads the header
-    // from a file created O_EXCL inside a unique temp dir that the guard
-    // removes on every return path. On unix both carry restrictive modes
-    // (dir 0700, file 0600); other platforms get the same O_EXCL
-    // exclusivity inside the private dir under the platform's default
-    // file ACL.
+    // The credential never enters argv and never touches a file: curl
+    // --config - reads the Authorization header from the child's stdin,
+    // so there is no token-bearing path on any platform.
     use std::io::Write;
-    let auth_dir = TempDir::private("auth")?;
-    let auth_file = auth_dir.path("header");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&auth_file)?
-            .write_all(format!("Authorization: Bearer {token}\n").as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&auth_file)?
-        .write_all(format!("Authorization: Bearer {token}\n").as_bytes())?;
+    use std::process::Stdio;
     let mut argv = vec![
         "-sS".into(),
+        "--config".into(),
+        "-".into(),
         "-X".into(),
         method.into(),
-        "-H".into(),
-        format!("@{}", auth_file.display()),
         "-H".into(),
         "Accept: application/vnd.github+json".into(),
     ];
@@ -184,10 +180,19 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     argv.push("-H".into());
     argv.push("X-GitHub-Api-Version: 2022-11-28".into());
     argv.push(format!("https://api.github.com{path}"));
-    let out = Command::new("curl")
+    let mut child = Command::new("curl")
         .args(&argv)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("curl failed")?;
+    child
+        .stdin
+        .take()
+        .context("curl stdin")?
+        .write_all(format!("header = \"Authorization: Bearer {token}\"\n").as_bytes())?;
+    let out = child.wait_with_output().context("curl failed")?;
     drop(body_dir);
     let text = String::from_utf8(out.stdout)?;
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
@@ -252,7 +257,7 @@ fn ruleset_deny_trailers(enforcement: &str, policy: &clean_your_attribution::Pol
         })
         .collect();
     json!({
-        "name": "clean-your-attribution",
+        "name": RS_DENY,
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
@@ -279,7 +284,7 @@ fn ruleset_tags(enforcement: &str) -> Value {
         "active"
     };
     json!({
-        "name": "clean-your-attribution-tags",
+        "name": RS_TAGS,
         "target": "tag",
         "enforcement": tag_enforcement,
         "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
@@ -311,7 +316,7 @@ fn literal_refs(branches: &[&str]) -> Vec<Value> {
 /// moment the operator names it.
 fn ruleset_protected(enforcement: &str, branches: &[&str]) -> Value {
     json!({
-        "name": "clean-your-attribution-protected",
+        "name": RS_PROTECTED,
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": literal_refs(branches), "exclude": [] } },
@@ -338,7 +343,7 @@ fn ruleset_protected(enforcement: &str, branches: &[&str]) -> Value {
 /// ruleset's include list only once their own copy has landed.
 fn ruleset_check(enforcement: &str, branches: &[&str]) -> Value {
     json!({
-        "name": "clean-your-attribution-check",
+        "name": RS_CHECK,
         "target": "branch",
         "enforcement": enforcement,
         "conditions": { "ref_name": { "include": literal_refs(branches), "exclude": [] } },
@@ -367,26 +372,20 @@ const MERGE_SETTINGS: &str = r#"{
 }"#;
 
 /// Every ruleset name this tool has ever owned, including the superseded
-/// pre-0.2.0 `~DEFAULT_BRANCH` ruleset — reconciliation removes any of
-/// them the current declaration does not want.
-const MANAGED_RULESETS: [&str; 5] = [
-    "clean-your-attribution",
-    "clean-your-attribution-tags",
-    "clean-your-attribution-protected",
-    "clean-your-attribution-check",
-    "clean-your-attribution-default",
-];
+/// pre-0.2.0 `~DEFAULT_BRANCH` ruleset — a name a payload builder no
+/// longer writes stays managed, so a rename cannot orphan a live gate.
+const MANAGED_RULESETS: [&str; 5] = [RS_DENY, RS_TAGS, RS_PROTECTED, RS_CHECK, RS_LEGACY_DEFAULT];
 
 /// The ruleset set a repo should end with: deny + tags always, the
 /// pull_request gate once branches are named, and the required check
 /// only while a named branch already carries the workflow file — an
 /// empty gated set would install a check nothing can produce.
 fn desired_rulesets(protected_named: bool, gated_nonzero: bool) -> Vec<&'static str> {
-    let mut names = vec!["clean-your-attribution", "clean-your-attribution-tags"];
+    let mut names = vec![RS_DENY, RS_TAGS];
     if protected_named {
-        names.push("clean-your-attribution-protected");
+        names.push(RS_PROTECTED);
         if gated_nonzero {
-            names.push("clean-your-attribution-check");
+            names.push(RS_CHECK);
         }
     }
     names
@@ -609,30 +608,40 @@ fn ensure_ruleset(
     Ok(())
 }
 
-/// Deletes tool-owned rulesets the current declaration does not want —
+/// The managed-but-undesired entries in a ruleset listing: what
+/// `--prune` deletes and what a plain run warns about. Pure — the
+/// destructive decision is testable without touching the API.
+fn stale_rulesets<'a>(list: &'a [Value], desired: &[&str]) -> Vec<(&'a str, i64)> {
+    list.iter()
+        .filter_map(|row| {
+            let name = row.get("name").and_then(Value::as_str)?;
+            let id = row.get("id").and_then(Value::as_i64)?;
+            (MANAGED_RULESETS.contains(&name) && !desired.contains(&name)).then_some((name, id))
+        })
+        .collect()
+}
+
+/// Handles tool-owned rulesets the current declaration does not want —
 /// a stale `check` ruleset demands a check no branch can produce, which
 /// deadlocks the very merge meant to carry the file back, and a stale
 /// `protected` or superseded `-default` set enforces scopes the operator
-/// never named. Removal is part of the declared set, not a fallback.
+/// never named. Deletion only happens under `--prune`: removal is an
+/// explicit operator declaration, so a partial rerun (a policy refresh
+/// naming no refs) can never silently strip gates it did not restate.
+/// Without `--prune` each stale ruleset is warned about instead.
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
     list: &[Value],
     desired: &[&str],
     dry_run: bool,
+    prune: bool,
 ) -> Result<()> {
     let base = format!("/repos/{owner}/{repo}/rulesets");
-    for row in list {
-        let Some(name) = row.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !MANAGED_RULESETS.contains(&name) || desired.contains(&name) {
-            continue;
-        }
-        let Some(id) = row.get("id").and_then(Value::as_i64) else {
-            continue;
-        };
-        if dry_run {
+    for (name, id) in stale_rulesets(list, desired) {
+        if !prune {
+            println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
+        } else if dry_run {
             println!("    ruleset {name}: would remove (stale)");
         } else {
             api("DELETE", &format!("{base}/{id}"), None)?;
@@ -676,7 +685,24 @@ pub fn run(argv: &[String]) -> Result<i32> {
         // workflow file before its check can activate — pending is not a
         // failure.
         let run = || -> Result<bool> {
-            let rulesets = list_paginated(&format!("/repos/{owner}/{repo}/rulesets?per_page=100"))?;
+            // Repo-owned rulesets only: organization-inherited rulesets
+            // share neither ownership nor a repo-level DELETE endpoint,
+            // and a same-named one must never be updated or pruned by a
+            // repo-scoped run. Filtered client-side as well because the
+            // listing param is a hint, not a contract.
+            let rulesets: Vec<Value> = list_paginated(&format!(
+                "/repos/{owner}/{repo}/rulesets?per_page=100&includes_parents=false"
+            ))?
+            .into_iter()
+            .filter(|r| {
+                let owned = r.get("source_type").and_then(Value::as_str) == Some("Repository");
+                if !owned {
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+                    println!("    ruleset {name}: skipped (inherited — not repo-owned)");
+                }
+                owned
+            })
+            .collect();
             // Tag protection lands before the workflow update. On an upgrade
             // path this preserves any older workflow that still scanned tag
             // pushes; on a first install a failure here simply means nothing
@@ -771,16 +797,18 @@ pub fn run(argv: &[String]) -> Result<i32> {
                     println!("    check@{branch}: deferred until the workflow lands there");
                 }
             }
-            // The declared set is the whole story: any tool-owned ruleset
-            // outside it — a stale check gate, an un-named protected set,
-            // the superseded -default ruleset — is removed, never left
-            // enforcing scopes the operator did not name.
+            // Tool-owned rulesets outside the declared set are never
+            // deleted silently: without --prune they are warned about,
+            // with --prune the declared set is the whole story and each
+            // stale set is removed — including the superseded -default
+            // ruleset from pre-0.2.0 installs.
             reconcile_rulesets(
                 owner,
                 repo,
                 &rulesets,
                 &desired_rulesets(!protect_refs.is_empty(), !gated.is_empty()),
                 args.dry_run,
+                args.prune,
             )?;
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");
@@ -837,8 +865,10 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        desired_rulesets, ruleset_check, ruleset_protected, ruleset_tags, MANAGED_RULESETS,
+        desired_rulesets, ruleset_check, ruleset_protected, ruleset_tags, stale_rulesets,
+        MANAGED_RULESETS,
     };
+    use serde_json::json;
 
     #[test]
     fn protection_rulesets_scope_only_named_branches() {
@@ -917,5 +947,30 @@ mod tests {
             }
         }
         assert!(MANAGED_RULESETS.contains(&"clean-your-attribution-default"));
+    }
+
+    #[test]
+    fn stale_rulesets_selects_only_managed_and_undesired() {
+        let list = vec![
+            json!({"name": "clean-your-attribution", "id": 1}),
+            json!({"name": "clean-your-attribution-check", "id": 2}),
+            json!({"name": "clean-your-attribution-default", "id": 3}),
+            json!({"name": "someone-elses", "id": 4}),
+            json!({"id": 5}),
+        ];
+        let desired = desired_rulesets(false, false);
+        let stale = stale_rulesets(&list, &desired);
+        assert_eq!(
+            stale,
+            [
+                ("clean-your-attribution-check", 2),
+                ("clean-your-attribution-default", 3)
+            ]
+        );
+        // A desired managed name is never stale, even mid-list.
+        let desired = desired_rulesets(true, true);
+        assert!(stale_rulesets(&list, &desired)
+            .iter()
+            .all(|(n, _)| *n == "clean-your-attribution-default"));
     }
 }
