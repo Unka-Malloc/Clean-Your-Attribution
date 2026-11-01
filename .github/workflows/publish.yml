@@ -66,7 +66,10 @@ jobs:
 
       # Upload the staged tarball, not the checkout: the extracted copy
       # gets its .cargo and rust-toolchain files stripped before cargo
-      # sees it, and --no-verify publishes without compiling.
+      # sees it, and --no-verify publishes without compiling. The sparse
+      # index is probed first: a version already on the registry — a
+      # first publish made by hand to claim the name, a retried run —
+      # is a green skip, not an error.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
@@ -74,6 +77,18 @@ jobs:
           stage=$(mktemp -d)
           tar -xzf "$GITHUB_WORKSPACE"/target/package/*.crate -C "$stage"
           package=$(find "$stage" -mindepth 1 -maxdepth 1 -type d)
+          name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$package/Cargo.toml" | head -1)
+          vers=$(sed -n 's/^version = "\(.*\)"/\1/p' "$package/Cargo.toml" | head -1)
+          case ${#name} in
+            1) idx="1/$name";;
+            2) idx="2/$name";;
+            3) idx="3/${name:0:1}/$name";;
+            *) idx="${name:0:2}/${name:2:2}/$name";;
+          esac
+          if curl -fsSL "https://index.crates.io/$idx" | grep -q "\"vers\":\"$vers\""; then
+            echo "$name $vers is already on crates.io — skipping"
+            exit 0
+          fi
           rm -f "$package/Cargo.toml.orig" \
             "$package/rust-toolchain" "$package/rust-toolchain.toml"
           rm -rf "$package/.cargo"
