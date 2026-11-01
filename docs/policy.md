@@ -150,15 +150,16 @@ repairs described below (the redundant `-default` and a deadlocked
   scoped at the branches that produce the check; a named branch still
   without the file stays out of its scope.
 
-Reconciliation is tiered by what a run can prove. Two repairs are
-unconditional because they are not declaration questions — and both
-are bounded so they can never weaken real enforcement: the superseded
-pre-0.2.0 `clean-your-attribution-default` ruleset is deleted under
-`--prune`, or without it only while the run installs an `active` deny
-successor (a report-only rerun leaves it warned, not removed); and a
-`check` ruleset whose every literal scoped branch lacks the workflow —
-a deadlock, since it demands a check that cannot run — is PUT
-`disabled` (deleting it still needs `--prune`). Everything else stale
+Reconciliation is tiered by what a run can prove. Two repairs happen
+without `--prune` because they are not declaration questions — and
+both are bounded so they can never weaken real enforcement: the
+superseded pre-0.2.0 `clean-your-attribution-default` ruleset is
+deleted under `--prune`, or without it only while the run installs an
+`active` deny successor (a report-only rerun leaves it warned, not
+removed); and a `check` ruleset whose every literal scoped branch
+lacks the workflow — a deadlock, since it demands a check that cannot
+run — is PUT `disabled` unconditionally (deleting it still needs
+`--prune`). Everything else stale
 keeps enforcing and is *warned* about and counted — the run footer
 names the leftover and the exit code reports it: a `-check` gate a run
 no longer names while some scoped branch still produces the check, or

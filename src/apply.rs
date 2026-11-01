@@ -672,12 +672,6 @@ fn repo_owned(row: &Value) -> bool {
     row.get("source_type").and_then(Value::as_str) == Some("Repository")
 }
 
-/// Handles tool-owned rulesets the current declaration does not want.
-/// Deletion only happens under `--prune`: removal is an explicit
-/// operator declaration, so a partial rerun (a policy refresh naming
-/// no refs) can never silently strip gates it did not restate.
-/// Without `--prune` each stale ruleset is warned about and counted —
-/// the run's footer and exit code say enforcement was left behind.
 /// The literal branch refs a `-check` ruleset detail declares in its
 /// include list. `None` when the scope is not provable from the payload
 /// alone — a symbolic pattern (`~ALL`, `~DEFAULT_BRANCH`), an empty
@@ -1060,7 +1054,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
 mod tests {
     use super::{
         apply_exit, deadlock_branches, desired_rulesets, repo_owned, ruleset_check,
-        ruleset_protected, ruleset_tags, stale_action, stale_rulesets, StaleAction,
+        ruleset_protected, ruleset_tags, stale_action, stale_rulesets, urlencode, StaleAction,
         MANAGED_RULESETS,
     };
     use serde_json::json;
@@ -1204,6 +1198,19 @@ mod tests {
         assert_eq!(deadlock_branches(&detail(json!([]))), None);
         assert_eq!(deadlock_branches(&detail(json!([42]))), None);
         assert_eq!(deadlock_branches(&json!({})), None);
+    }
+
+    #[test]
+    fn urlencode_keeps_slashes_and_escapes_everything_else() {
+        assert_eq!(urlencode("release/1.0"), "release/1.0");
+        assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(urlencode("a?b"), "a%3Fb");
+        assert_eq!(urlencode("a#b"), "a%23b");
+        assert_eq!(urlencode("a&b"), "a%26b");
+        assert_eq!(urlencode("a%b"), "a%25b");
+        assert_eq!(urlencode("a b"), "a%20b");
+        // Non-ASCII bytes percent-encode rather than pass through raw.
+        assert_eq!(urlencode("brànch"), "br%C3%A0nch");
     }
 
     #[test]
