@@ -154,7 +154,8 @@ deny successor; a stale gate that can provably never fire — a
 that still covers a live branch keeps enforcing, is reported
 `stale`, counted in the footer and surfaced as exit code 3 until
 `--prune` deletes it — so a partial rerun can never silently strip a
-live gate. Exit codes: `0` clean, `1` repo failure(s),
+live gate. A leftover already `disabled` is reported and counted too,
+but costs no probes and no write. Exit codes: `0` clean, `1` repo failure(s),
 `3` undeclared rulesets left, `2` usage/pre-flight error.
 
 Credentials come from `GITHUB_TOKEN` if set, else `gh api` (any `gh`

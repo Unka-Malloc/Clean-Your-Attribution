@@ -186,6 +186,23 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ApiNotFound>().is_some()
 }
 
+/// Splits curl's `-w "\n%{http_code}"` framing into (status, body) —
+/// the trailer line is always the last one. An absent or unparseable
+/// marker yields status 0, which classifies as a generic failure, never
+/// as NotFound.
+fn split_http_status(stdout: &str) -> (u16, &str) {
+    let (body, code) = stdout.rsplit_once('\n').unwrap_or((stdout, ""));
+    (code.trim().parse().unwrap_or(0), body)
+}
+
+/// Extracts the status from gh's `gh: <msg> (HTTP <code>)` stderr shape.
+/// `None` on any other shape — the caller then degrades to a plain
+/// transport error, never a NotFound verdict.
+fn gh_http_status(stderr: &str) -> Option<u16> {
+    let (_, rest) = stderr.split_once("(HTTP ")?;
+    rest.get(..3)?.parse().ok()
+}
+
 fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let token = env::var("GITHUB_TOKEN").unwrap();
     // The credential never enters argv and never touches a file: curl
@@ -234,8 +251,7 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     anyhow::ensure!(out.status.success(), "curl failed: {text}");
     // curl success ≠ API success — classify on the real status line, not
     // on prose. 404/410 is the only provable "object is gone" answer.
-    let (body_text, code) = text.rsplit_once('\n').unwrap_or((text.as_str(), ""));
-    let status: u16 = code.trim().parse().unwrap_or(0);
+    let (status, body_text) = split_http_status(&text);
     if status == 404 || status == 410 {
         return Err(ApiNotFound {
             context: format!("{method} {path}"),
@@ -275,9 +291,7 @@ fn api_gh(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         // gh reports errors as `gh: <msg> (HTTP <code>)` — the "(HTTP nnn)"
         // token is the transport's own status, safe to classify on.
-        let status = stderr
-            .find("(HTTP ")
-            .and_then(|i| stderr[i + 6..i + 9].parse::<u16>().ok());
+        let status = gh_http_status(&stderr);
         if matches!(status, Some(404 | 410)) {
             return Err(ApiNotFound {
                 context: format!("{method} {path}"),
@@ -503,6 +517,12 @@ fn list_repos(args: &Args) -> Result<Vec<String>> {
 
 /// Fetches the workflow file as it exists on `git_ref` (None = the repo's
 /// default branch). A missing file is `None`; real API failures propagate.
+/// The API path for a branch's git ref — one place so the existence
+/// check and the dead-gate probe can never disagree about escaping.
+fn branch_ref_path(owner: &str, repo: &str, branch: &str) -> String {
+    format!("/repos/{owner}/{repo}/git/ref/heads/{}", urlencode(branch))
+}
+
 /// Minimal percent-encoding for a query value — `/` stays readable
 /// (branch names carry it constantly); anything else unusual is
 /// escaped so a ref can never break out of the parameter.
@@ -693,13 +713,16 @@ fn ensure_ruleset(
 
 /// The managed-but-undesired rows in a ruleset listing: what `--prune`
 /// deletes and what a plain run warns about or disarms. Pure — the
-/// selection is testable without touching the API; the caller reads
-/// name/id/enforcement off each row.
+/// selection is testable without touching the API. Admissible rows
+/// carry both a managed `name` and an integer `id`: a partial row can
+/// never be turned into a request against a fabricated identifier.
 fn stale_rows<'a>(list: &'a [Value], desired: &[&str]) -> Vec<&'a Value> {
     list.iter()
         .filter(|row| {
             let name = row.get("name").and_then(Value::as_str).unwrap_or_default();
-            MANAGED_RULESETS.contains(&name) && !desired.contains(&name)
+            MANAGED_RULESETS.contains(&name)
+                && !desired.contains(&name)
+                && row.get("id").and_then(Value::as_i64).is_some()
         })
         .collect()
 }
@@ -758,6 +781,14 @@ enum StaleAction {
     Disable,
     /// Everything else keeps enforcing: warned, counted, exit 3.
     Warn,
+}
+
+/// Whether a dead-gate probe is worth its API calls at all: only the
+/// two branch-scoped gate kinds can die, never under `--prune` (they
+/// are deleted outright), and never for a gate already `disabled` —
+/// reaching a state that is in place would spend requests for nothing.
+fn probe_needed(name: &str, prune: bool, already_disabled: bool) -> bool {
+    !prune && !already_disabled && matches!(name, RS_CHECK | RS_PROTECTED)
 }
 
 fn stale_action(name: &str, prune: bool, deny_enforcing: bool, provably_dead: bool) -> StaleAction {
@@ -838,29 +869,31 @@ fn reconcile_rulesets(
     let base = format!("/repos/{owner}/{repo}/rulesets");
     let mut left = 0;
     for row in stale_rows(list, desired) {
-        let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
-        let id = row.get("id").and_then(Value::as_i64).unwrap_or_default();
+        let (Some(name), Some(id)) = (
+            row.get("name").and_then(Value::as_str),
+            row.get("id").and_then(Value::as_i64),
+        ) else {
+            // Unreachable in practice — the selector admits only rows
+            // carrying both — but never fabricate an identifier.
+            continue;
+        };
         // An already-disabled gate needs neither probes nor a PUT: it is
         // still undeclared, so it counts as left — but no requests are
         // spent reaching a state that is already in place.
         let already_disabled = row.get("enforcement").and_then(Value::as_str) == Some("disabled");
-        let dead = if prune || already_disabled {
+        let dead = if !probe_needed(name, prune, already_disabled) {
             None
         } else {
             match name {
-                n if n == RS_CHECK => proven_dead(owner, repo, id, |b| {
+                RS_CHECK => proven_dead(owner, repo, id, |b| {
                     match workflow_file(owner, repo, Some(b)) {
                         Ok(Some(_)) => BranchVerdict::Alive,
                         Ok(None) => BranchVerdict::Dead,
                         Err(_) => BranchVerdict::Unknown,
                     }
                 }),
-                n if n == RS_PROTECTED => proven_dead(owner, repo, id, |b| {
-                    match api(
-                        "GET",
-                        &format!("/repos/{owner}/{repo}/git/ref/heads/{}", urlencode(b)),
-                        None,
-                    ) {
+                RS_PROTECTED => proven_dead(owner, repo, id, |b| {
+                    match api("GET", &branch_ref_path(owner, repo, b), None) {
                         Ok(_) => BranchVerdict::Alive,
                         Err(e) if is_not_found(&e) => BranchVerdict::Dead,
                         Err(_) => BranchVerdict::Unknown,
@@ -1036,12 +1069,8 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 println!("    protected branches: none named (no --protect-refs for this repo)");
             } else {
                 for branch in &protect_refs {
-                    api(
-                        "GET",
-                        &format!("/repos/{owner}/{repo}/git/ref/heads/{branch}"),
-                        None,
-                    )
-                    .with_context(|| format!("protected branch {branch} not found"))?;
+                    api("GET", &branch_ref_path(owner, repo, branch), None)
+                        .with_context(|| format!("protected branch {branch} not found"))?;
                     if workflow_file(owner, repo, Some(branch))?.is_some()
                         || (args.dry_run && repo_refs.contains(branch))
                     {
@@ -1157,9 +1186,9 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dead, apply_exit, desired_rulesets, literal_branches, repo_owned, ruleset_check,
-        ruleset_protected, ruleset_tags, stale_action, stale_rows, urlencode, BranchVerdict,
-        StaleAction, MANAGED_RULESETS,
+        all_dead, apply_exit, desired_rulesets, gh_http_status, literal_branches, probe_needed,
+        repo_owned, ruleset_check, ruleset_protected, ruleset_tags, split_http_status,
+        stale_action, stale_rows, urlencode, BranchVerdict, StaleAction, MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -1317,6 +1346,46 @@ mod tests {
         assert_eq!(literal_branches(&detail(json!(["refs/heads/a?"]))), None);
         assert_eq!(literal_branches(&detail(json!(["refs/heads/x[y]"]))), None);
         assert_eq!(literal_branches(&detail(json!(["refs/heads/"]))), None);
+    }
+
+    #[test]
+    fn http_status_parsing() {
+        // curl -w framing: status is the trailing line, body untouched.
+        assert_eq!(split_http_status("{\"a\":1}\n200"), (200, "{\"a\":1}"));
+        assert_eq!(split_http_status("\n204"), (204, ""));
+        assert_eq!(split_http_status("{}\n404"), (404, "{}"));
+        assert_eq!(split_http_status("{}\n410"), (410, "{}"));
+        assert_eq!(split_http_status("{}\n403"), (403, "{}"));
+        assert_eq!(split_http_status("{}\n502"), (502, "{}"));
+        // Absent or unparseable markers classify as 0 — never NotFound.
+        assert_eq!(split_http_status("{\"a\":1}"), (0, "{\"a\":1}"));
+        assert_eq!(split_http_status(""), (0, ""));
+        // gh stderr: only the "(HTTP nnn)" token counts.
+        assert_eq!(
+            gh_http_status("gh: Not Found (HTTP 404)\nhttps://api.github.com/x"),
+            Some(404)
+        );
+        assert_eq!(gh_http_status("gh: Forbidden (HTTP 403)"), Some(403));
+        assert_eq!(gh_http_status("gh: some other error"), None);
+        assert_eq!(gh_http_status(""), None);
+    }
+
+    #[test]
+    fn probe_only_for_live_branch_scoped_gates() {
+        assert!(probe_needed("clean-your-attribution-check", false, false));
+        assert!(probe_needed(
+            "clean-your-attribution-protected",
+            false,
+            false
+        ));
+        assert!(!probe_needed("clean-your-attribution-check", true, false));
+        assert!(!probe_needed("clean-your-attribution-check", false, true));
+        assert!(!probe_needed(
+            "clean-your-attribution-default",
+            false,
+            false
+        ));
+        assert!(!probe_needed("clean-your-attribution", false, false));
     }
 
     #[test]
