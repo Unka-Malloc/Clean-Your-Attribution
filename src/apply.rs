@@ -629,6 +629,16 @@ fn stale_rulesets<'a>(list: &'a [Value], desired: &[&str]) -> Vec<(&'a str, i64)
 /// explicit operator declaration, so a partial rerun (a policy refresh
 /// naming no refs) can never silently strip gates it did not restate.
 /// Without `--prune` each stale ruleset is warned about instead.
+/// Rows a repo-scoped run may touch: the listing asks the API for
+/// repo-owned objects (`includes_parents=false`), but the field check
+/// stays as the contract — an inherited organization ruleset sharing a
+/// product name must never be updated or pruned from a repo run. A
+/// missing `source_type` is treated as unowned and reported distinctly,
+/// never silently dropped.
+fn repo_owned(row: &Value) -> bool {
+    row.get("source_type").and_then(Value::as_str) == Some("Repository")
+}
+
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
@@ -636,10 +646,12 @@ fn reconcile_rulesets(
     desired: &[&str],
     dry_run: bool,
     prune: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let base = format!("/repos/{owner}/{repo}/rulesets");
+    let mut left = 0;
     for (name, id) in stale_rulesets(list, desired) {
         if !prune {
+            left += 1;
             println!("    ruleset {name}: stale — not in the declared set (rerun with --prune to remove)");
         } else if dry_run {
             println!("    ruleset {name}: would remove (stale)");
@@ -648,7 +660,7 @@ fn reconcile_rulesets(
             println!("    ruleset {name}: removed (stale)");
         }
     }
-    Ok(())
+    Ok(left)
 }
 
 pub fn run(argv: &[String]) -> Result<i32> {
@@ -671,6 +683,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
         }
     }
     let mut pending = Vec::new();
+    let mut stale_left_total = 0usize;
     for full in &repos {
         let (owner, repo) = full
             .split_once('/')
@@ -684,7 +697,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
         // Returns Ok(true) while a protected branch still waits on the
         // workflow file before its check can activate — pending is not a
         // failure.
-        let run = || -> Result<bool> {
+        let run = || -> Result<(bool, usize)> {
             // Repo-owned rulesets only: organization-inherited rulesets
             // share neither ownership nor a repo-level DELETE endpoint,
             // and a same-named one must never be updated or pruned by a
@@ -695,12 +708,16 @@ pub fn run(argv: &[String]) -> Result<i32> {
             ))?
             .into_iter()
             .filter(|r| {
-                let owned = r.get("source_type").and_then(Value::as_str) == Some("Repository");
-                if !owned {
-                    let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
-                    println!("    ruleset {name}: skipped (inherited — not repo-owned)");
+                if repo_owned(r) {
+                    return true;
                 }
-                owned
+                let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+                let why = match r.get("source_type").and_then(Value::as_str) {
+                    Some(source) => format!("inherited from {source}"),
+                    None => "unknown ownership".to_string(),
+                };
+                println!("    ruleset {name}: skipped ({why} — not repo-owned)");
+                false
             })
             .collect();
             // Tag protection lands before the workflow update. On an upgrade
@@ -781,7 +798,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 )?;
                 if gated.is_empty() {
                     println!(
-                        "    ruleset clean-your-attribution-check: skipped — no protected \
+                        "    ruleset {RS_CHECK}: skipped — no protected \
                          branch carries the workflow yet"
                     );
                 } else {
@@ -802,7 +819,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
             // with --prune the declared set is the whole story and each
             // stale set is removed — including the superseded -default
             // ruleset from pre-0.2.0 installs.
-            reconcile_rulesets(
+            let stale_left = reconcile_rulesets(
                 owner,
                 repo,
                 &rulesets,
@@ -820,7 +837,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 )?;
                 println!("    settings: squash-only + PR title");
             }
-            Ok(!awaiting.is_empty())
+            Ok((!awaiting.is_empty(), stale_left))
         };
         match run() {
             Err(e) => {
@@ -831,14 +848,16 @@ pub fn run(argv: &[String]) -> Result<i32> {
                      partly enrolled; rerun cya apply before treating it as covered"
                 );
             }
-            Ok(true) => {
-                pending.push(full.clone());
-                println!(
-                    "    pending: protected branches without the workflow get their check \
-                     once the file lands — carry it there through your own path, then rerun"
-                );
+            Ok((is_pending, stale)) => {
+                stale_left_total += stale;
+                if is_pending {
+                    pending.push(full.clone());
+                    println!(
+                        "    pending: protected branches without the workflow get their check \
+                         once the file lands — carry it there through your own path, then rerun"
+                    );
+                }
             }
-            Ok(false) => {}
         }
     }
     if !pending.is_empty() {
@@ -849,24 +868,33 @@ pub fn run(argv: &[String]) -> Result<i32> {
             pending.join(", ")
         );
     }
-    if failures.is_empty() {
-        println!("done");
-        Ok(0)
-    } else {
+    if stale_left_total > 0 {
+        println!(
+            "{stale_left_total} stale tool-owned ruleset(s) still enforcing — \
+             rerun with --prune to remove them"
+        );
+    }
+    if !failures.is_empty() {
         println!(
             "done with {} failure(s): {}",
             failures.len(),
             failures.join(", ")
         );
         Ok(1)
+    } else if stale_left_total > 0 {
+        println!("done (stale rulesets pending removal)");
+        Ok(2)
+    } else {
+        println!("done");
+        Ok(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        desired_rulesets, ruleset_check, ruleset_protected, ruleset_tags, stale_rulesets,
-        MANAGED_RULESETS,
+        desired_rulesets, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
+        stale_rulesets, MANAGED_RULESETS,
     };
     use serde_json::json;
 
@@ -947,6 +975,19 @@ mod tests {
             }
         }
         assert!(MANAGED_RULESETS.contains(&"clean-your-attribution-default"));
+    }
+
+    #[test]
+    fn repo_owned_accepts_repository_rows_only() {
+        assert!(repo_owned(
+            &json!({"source_type": "Repository", "name": "a"})
+        ));
+        assert!(!repo_owned(
+            &json!({"source_type": "Organization", "name": "a"})
+        ));
+        // A missing source_type is fail-closed: treated as unowned, and
+        // the caller logs it distinctly rather than silently dropping it.
+        assert!(!repo_owned(&json!({"name": "a"})));
     }
 
     #[test]

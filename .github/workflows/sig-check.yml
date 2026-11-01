@@ -32,6 +32,9 @@ jobs:
     # required check.
     if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    # A stalled index or registry host must not hold a billed runner for the
+    # job default — every step below is seconds-to-minutes of real work.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -62,7 +65,44 @@ jobs:
               ;;
           esac
 
+      - name: Resolve the published cya version
+        id: cya-version
+        run: |
+          # Every index record is judged: yanked entries are dropped and the
+          # maximum stable semver wins, so a backported patch published after
+          # the newest release cannot steal the pin. An unresolvable index
+          # emits an empty version — the provisioning step's unreleased path,
+          # not a dead run that leaves a required check red.
+          ver="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
+            https://index.crates.io/cl/ea/clean-your-attribution | python3 -c '
+          import json, re, sys
+          versions = []
+          for line in sys.stdin:
+              try:
+                  rec = json.loads(line)
+              except ValueError:
+                  continue
+              v = rec.get("vers", "")
+              if rec.get("yanked") or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", v):
+                  continue
+              versions.append(v)
+          pool = [v for v in versions if "-" not in v] or versions
+          print(max(pool, key=lambda v: tuple(int(x) for x in v.split("-")[0].split("."))) if pool else "")
+          ')"
+          echo "resolved cya ${ver:-<none — unreleased path>}"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the cya binary
+        id: cya-bin
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cya
+          key: cya-bin-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      # The registry restore is tens of MB — skip it when the binary itself
+      # is already cached: nothing below consumes the registry on a warm run.
       - name: Cache cargo registry
+        if: steps.cya-bin.outputs.cache-hit != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -71,35 +111,27 @@ jobs:
           key: cya-cargo-${{ runner.os }}-${{ runner.arch }}
           restore-keys: cya-cargo-
 
-      - name: Resolve the published cya version
-        id: cya-version
-        run: |
-          set -e
-          # The same sparse index cargo reads: last record is the latest
-          # published version — the run's pin and cache key.
-          ver="$(curl -fsSL https://index.crates.io/cl/ea/clean-your-attribution \
-            | tail -n1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["vers"])')"
-          echo "resolved cya $ver"
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-
-      - name: Cache the cya binary
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cargo/bin/cya
-          key: cya-bin-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
-
       - name: Provision cya
+        env:
+          CYA_VERSION: ${{ steps.cya-version.outputs.version }}
         run: |
           set -e
           if [ -x ~/.cargo/bin/cya ]; then
-            echo "cached cya ${{ steps.cya-version.outputs.version }}"
-          elif ! cargo install "clean-your-attribution@${{ steps.cya-version.outputs.version }}" \
+            echo "cached cya $CYA_VERSION"
+          elif [ -z "$CYA_VERSION" ]; then
+            # Unreleased path: the index could not name a version (nothing
+            # published yet, or an index outage) — the crate's own Git tree
+            # is the only source left, and the run says so.
+            echo "no published version resolved — building unreleased HEAD from source"
+            cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
+              --locked --bin cya
+          elif ! cargo install "clean-your-attribution@${CYA_VERSION}" \
                 --locked --bin cya; then
             # Pre-release fallback: the same version's tag, never a
             # floating HEAD — a run of an unreleased tree says so.
-            echo "registry install failed — building tag v${{ steps.cya-version.outputs.version }} from source"
+            echo "registry install failed — building tag v${CYA_VERSION} from source"
             cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
-              --tag "v${{ steps.cya-version.outputs.version }}" \
+              --tag "v${CYA_VERSION}" \
               --locked --bin cya
           fi
           ~/.cargo/bin/cya policy --check

@@ -83,9 +83,12 @@ an `--enforcement evaluate` staging run must not silently reopen tag
 writes while the workflow skips them; only `disabled` turns it off.
 
 The workflow provisions the `cya` binary from the published crates.io
-package — the resolved version is pinned and logged per run, the build
-is `--locked`, and the compiled binary is cached per version; a
-tag-pinned `cargo install --git` is the only fallback.
+package — the maximum stable (non-yanked) version the sparse index
+resolves is pinned and logged per run, the build is `--locked`, and the
+compiled binary is cached per version. A failed registry install falls
+back to a tag-pinned `cargo install --git`; an unresolvable index
+(nothing published yet, or an outage) falls back to building the
+repository HEAD, and the run says so plainly either way.
 
 `cya apply` rolls all of that out across organizations and accounts:
 

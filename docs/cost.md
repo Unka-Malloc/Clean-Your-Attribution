@@ -52,8 +52,12 @@ Trust basis, stated plainly: the `.crate` is packaged by `cargo publish`
 from the operator's local checkout under their crates.io credentials —
 there is no build attestation or provenance record beyond the tag
 pointing at the same commit. `sig-check.yml` consumers install the
-binary through `cargo install clean-your-attribution --locked`, so the
-shipped `Cargo.lock` pins every dependency of what they build.
+binary through `cargo install clean-your-attribution@<resolved> --locked`:
+the crates.io sparse index chooses the release at run time (maximum
+stable non-yanked version, pinned and logged per run), the shipped
+`Cargo.lock` pins every dependency of what they build, and the binary
+cache is keyed on that resolved version so the run output always names
+what scanned a commit.
 
 ## Local CLI (`cya`)
 
