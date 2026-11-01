@@ -1,8 +1,10 @@
 //! cya — clean your attribution. Local enforcement surface of
 //! clean-your-attribution: scan, strip, rewrite ranges, install hooks so
-//! denied attribution never forms, and switch local agents' own
-//! attribution options off. The server-side surface is
-//! `.github/workflows/sig-check.yml`.
+//! denied attribution never forms, switch local agents' own attribution
+//! options off, and apply the server-side surfaces to repositories. The
+//! server-side surface is `.github/workflows/sig-check.yml`.
+
+mod apply;
 
 use anyhow::{Context, Result};
 use clean_your_attribution::agents;
@@ -618,6 +620,11 @@ const USAGE: &str = "cya — clean your attribution
   cya hook [--dir DIR] [--force]                 install commit-msg + pre-push hooks
   cya policy [--check]                           print / verify effective policy
   cya agents [off [ID]]                          agent attribution switches: report, or off all / one
+  cya apply [flags]                              rollout: rulesets + merge settings + workflow file
+                                                 --repos/--orgs/--users pick remote repos;
+                                                 --install-refs o/r:branch commits the workflow there;
+                                                 --protect-refs o/r:branch gates merges on those branches;
+                                                 --local PATH:branch writes the file into a checkout
 
 Policy: --policy-url URL or CYA_POLICY_URL, else the compiled-in policy.
 ";
@@ -628,6 +635,8 @@ fn main() {
     let rest = argv.get(1..).unwrap_or(&[]);
     let code = if command == "hook" {
         cmd_hook(rest)
+    } else if command == "apply" {
+        apply::run(rest)
     } else if command == "agents" {
         cmd_agents(&argv)
     } else {

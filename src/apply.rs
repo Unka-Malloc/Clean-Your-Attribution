@@ -1,12 +1,24 @@
-//! cya-apply — fleet rollout for clean-your-attribution: install the
-//! check workflow, three repo rulesets, and squash-only merge settings
-//! on every targeted repository.
+//! cya apply — rollout for clean-your-attribution: install the check
+//! workflow, the repo rulesets, and squash-only merge settings on every
+//! targeted repository, remote or local.
 //!
-//!   cya-apply --orgs ORG1,ORG2 --users OWNER \
+//!   cya apply --orgs ORG1,ORG2 --users OWNER \
 //!     [--enforcement evaluate|active|disabled] [--include-private] \
-//!     [--repos o/r,...] [--dry-run]
+//!     [--repos o/r,...] [--install-refs o/r:BRANCH,..] \
+//!     [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] [--dry-run]
 //!
-//! Credentials: GITHUB_TOKEN if set (via curl), otherwise `gitvault api`
+//! The tool never opens branches or pull requests and never guesses where
+//! anything belongs: `--install-refs` names (repo, branch) pairs that get
+//! the workflow file as a direct commit; `--protect-refs` names (repo,
+//! branch) pairs whose merges require a pull request and — once the file
+//! exists on that branch — the scan check; `--local` names a checkout and
+//! the branch it must be on, then writes the file into the worktree for
+//! the operator to commit and promote. A ref that refuses the write or a
+//! checkout on the wrong branch fails the run — promotion through
+//! protected branches is the operator's own pipeline, not this tool's
+//! behavior.
+//!
+//! Credentials: GITHUB_TOKEN if set (via curl), otherwise `gh api`
 //! with --identity personal — the credential never leaves the vault
 //! process; this binary only receives API responses.
 
@@ -27,12 +39,14 @@ struct Args {
     users: Vec<String>,
     repos: Vec<String>,
     enforcement: String,
+    install_refs: Vec<(String, String)>,
+    protect_refs: Vec<(String, String)>,
+    local_refs: Vec<(String, String)>,
     include_private: bool,
     dry_run: bool,
 }
 
-fn parse_args() -> Result<Args> {
-    let argv: Vec<String> = env::args().skip(1).collect();
+fn parse_args(argv: &[String]) -> Result<Args> {
     let list = |name: &str| -> Vec<String> {
         argv.iter()
             .position(|a| a == name)
@@ -55,13 +69,30 @@ fn parse_args() -> Result<Args> {
         "--enforcement must be evaluate|active|disabled"
     );
     if argv.is_empty() || argv.iter().any(|a| a == "--help") {
-        bail!("usage: cya-apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--include-private] [--dry-run]");
+        bail!("usage: cya apply --orgs o[,o..] --users u[,u..] [--repos o/r,..] [--enforcement evaluate|active|disabled] [--install-refs o/r:BRANCH,..] [--protect-refs o/r:BRANCH,..] [--local PATH:BRANCH,..] [--include-private] [--dry-run]");
     }
+    let combos = |flag: &str, require_slash: bool| -> Result<Vec<(String, String)>> {
+        let mut pairs = Vec::new();
+        for entry in list(flag) {
+            let (repo, branch) = entry
+                .split_once(':')
+                .with_context(|| format!("{flag} entry {entry:?} must be TARGET:branch"))?;
+            anyhow::ensure!(
+                (!require_slash || repo.contains('/')) && !branch.is_empty(),
+                "{flag} entry {entry:?} must be TARGET:branch"
+            );
+            pairs.push((repo.to_string(), branch.to_string()));
+        }
+        Ok(pairs)
+    };
     Ok(Args {
         orgs: list("--orgs"),
         users: list("--users"),
         repos: list("--repos"),
         enforcement,
+        install_refs: combos("--install-refs", true)?,
+        protect_refs: combos("--protect-refs", true)?,
+        local_refs: combos("--local", false)?,
         include_private: argv.iter().any(|a| a == "--include-private"),
         dry_run: argv.iter().any(|a| a == "--dry-run"),
     })
@@ -73,7 +104,7 @@ fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     if env::var("GITHUB_TOKEN").is_ok() {
         api_curl(method, path, body)
     } else {
-        api_gitvault(method, path, body)
+        api_gh(method, path, body)
     }
 }
 
@@ -166,9 +197,8 @@ fn api_curl(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     Ok(value)
 }
 
-fn api_gitvault(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+fn api_gh(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let mut argv = vec!["api".to_string(), path.to_string()];
-    argv.extend(["--identity".into(), "personal".into()]);
     if method != "GET" {
         argv.extend(["-X".into(), method.into()]);
     }
@@ -180,19 +210,19 @@ fn api_gitvault(method: &str, path: &str, body: Option<&Value>) -> Result<Value>
         argv.extend(["--input".into(), file.display().to_string()]);
         body_dir = Some(dir);
     }
-    let out = Command::new("gitvault").args(&argv).output();
+    let out = Command::new("gh").args(&argv).output();
     drop(body_dir);
-    let out = out.context("gitvault failed to run")?;
+    let out = out.context("gh failed to run")?;
     anyhow::ensure!(
         out.status.success(),
-        "gitvault {method} {path}: {}",
+        "gh api {method} {path}: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     let text = String::from_utf8(out.stdout)?;
     Ok(if text.trim().is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(&text).context("gitvault returned non-JSON")?
+        serde_json::from_str(&text).context("gh returned non-JSON")?
     })
 }
 
@@ -259,12 +289,25 @@ fn ruleset_tags(enforcement: &str) -> Value {
     })
 }
 
-fn ruleset_default_branch(enforcement: &str) -> Value {
+/// A ruleset's ref scope is a flat include list — literal branch refs, not
+/// the `~DEFAULT_BRANCH` symbol. Protection covers exactly the branches the
+/// operator names; nothing is scoped implicitly.
+fn literal_refs(branches: &[&str]) -> Vec<Value> {
+    branches
+        .iter()
+        .map(|b| json!(format!("refs/heads/{b}")))
+        .collect()
+}
+
+/// Merges into a protected branch must come through a pull request. This
+/// ruleset needs no workflow file, so it lands on every named branch the
+/// moment the operator names it.
+fn ruleset_protected(enforcement: &str, branches: &[&str]) -> Value {
     json!({
-        "name": "clean-your-attribution-default",
+        "name": "clean-your-attribution-protected",
         "target": "branch",
         "enforcement": enforcement,
-        "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+        "conditions": { "ref_name": { "include": literal_refs(branches), "exclude": [] } },
         "rules": [
             {
                 "type": "pull_request",
@@ -276,6 +319,23 @@ fn ruleset_default_branch(enforcement: &str) -> Value {
                     "required_review_thread_resolution": false,
                 },
             },
+        ],
+        "bypass_actors": [],
+    })
+}
+
+/// The scan check may only be required on branches that carry the workflow
+/// file: a `pull_request` event runs the base branch's copy, so requiring
+/// the check where no file exists deadlocks every merge into that branch —
+/// including the promotion that would carry the file in. Branches join this
+/// ruleset's include list only once their own copy has landed.
+fn ruleset_check(enforcement: &str, branches: &[&str]) -> Value {
+    json!({
+        "name": "clean-your-attribution-check",
+        "target": "branch",
+        "enforcement": enforcement,
+        "conditions": { "ref_name": { "include": literal_refs(branches), "exclude": [] } },
+        "rules": [
             {
                 "type": "required_status_checks",
                 "parameters": {
@@ -318,6 +378,9 @@ fn list_paginated(path: &str) -> Result<Vec<Value>> {
 
 fn list_repos(args: &Args) -> Result<Vec<String>> {
     let mut named: Vec<String> = args.repos.clone();
+    for (repo, _) in args.install_refs.iter().chain(args.protect_refs.iter()) {
+        named.push(repo.clone());
+    }
     for org in &args.orgs {
         for r in list_paginated(&format!("/orgs/{org}/repos?per_page=100&type=all"))? {
             if let Some(name) = r.get("full_name").and_then(Value::as_str) {
@@ -337,25 +400,62 @@ fn list_repos(args: &Args) -> Result<Vec<String>> {
     Ok(named)
 }
 
-fn ensure_workflow(owner: &str, repo: &str, workflow_content: &str, dry_run: bool) -> Result<()> {
-    let path = format!("/repos/{owner}/{repo}/contents/{WORKFLOW_PATH}");
-    let existing = api("GET", &path, None).ok();
-    let same = existing
-        .as_ref()
-        .and_then(|v| v.get("content").and_then(Value::as_str))
+/// Fetches the workflow file as it exists on `git_ref` (None = the repo's
+/// default branch). A missing file is `None`; real API failures propagate.
+fn workflow_file(owner: &str, repo: &str, git_ref: Option<&str>) -> Result<Option<Value>> {
+    let mut path = format!("/repos/{owner}/{repo}/contents/{WORKFLOW_PATH}");
+    if let Some(r) = git_ref {
+        path = format!("{path}?ref={r}");
+    }
+    match api("GET", &path, None) {
+        Ok(v) if v.get("sha").and_then(Value::as_str).is_some() => Ok(Some(v)),
+        Ok(_) => Ok(None),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("Not Found") || msg.contains("404") {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn contents_match(entry: &Value, workflow_content: &str) -> bool {
+    entry
+        .get("content")
+        .and_then(Value::as_str)
         .map(|c| {
             B64.decode(c.replace('\n', ""))
                 .map(|b| String::from_utf8_lossy(&b) == workflow_content)
                 .unwrap_or(false)
         })
-        .unwrap_or(false);
-    if same {
-        println!("    workflow: already installed");
+        .unwrap_or(false)
+}
+
+/// Commits the workflow file onto the explicitly named `target` branch.
+/// Nothing else moves: no branch creation, no pull request, no fallback to
+/// another ref — a target that refuses the write propagates its error and
+/// the repo is reported not fully protected.
+fn ensure_workflow_ref(
+    owner: &str,
+    repo: &str,
+    target: &str,
+    workflow_content: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let existing = workflow_file(owner, repo, Some(target))?;
+    if existing
+        .as_ref()
+        .map(|v| contents_match(v, workflow_content))
+        .unwrap_or(false)
+    {
+        println!("    workflow@{target}: already installed");
         return Ok(());
     }
     if dry_run {
         println!(
-            "    workflow: would {} {WORKFLOW_PATH}",
+            "    workflow@{target}: would {} {WORKFLOW_PATH}",
             if existing.is_some() {
                 "update"
             } else {
@@ -367,15 +467,72 @@ fn ensure_workflow(owner: &str, repo: &str, workflow_content: &str, dry_run: boo
     let mut body = json!({
         "message": "chore(attribution): install clean-your-attribution check workflow",
         "content": B64.encode(workflow_content),
+        "branch": target,
     });
     if let Some(sha) = existing.and_then(|v| v.get("sha").and_then(Value::as_str).map(String::from))
     {
         body["sha"] = json!(sha);
     }
-    api("PUT", &path, Some(&body))?;
+    api(
+        "PUT",
+        &format!("/repos/{owner}/{repo}/contents/{WORKFLOW_PATH}"),
+        Some(&body),
+    )?;
     println!(
-        "    workflow: {}",
+        "    workflow@{target}: {}",
         if body.get("sha").is_some() {
+            "updated"
+        } else {
+            "created"
+        }
+    );
+    Ok(())
+}
+
+/// Local target: writes the workflow file into a checkout's worktree. The
+/// combo names the branch the checkout must already be on — the tool
+/// verifies and refuses on a mismatch rather than switching branches;
+/// committing and promoting the file stays with the operator.
+fn ensure_workflow_local(
+    dir: &str,
+    branch: &str,
+    workflow_content: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let out = Command::new("git")
+        .args(["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .with_context(|| format!("{dir}: cannot inspect the checkout"))?;
+    anyhow::ensure!(out.status.success(), "{dir}: not a git checkout");
+    let actual = String::from_utf8(out.stdout)?.trim().to_string();
+    anyhow::ensure!(
+        actual == branch,
+        "{dir}: checkout is on {actual}, not {branch} — switch it yourself"
+    );
+    let path = std::path::Path::new(dir).join(WORKFLOW_PATH);
+    let existing = fs::read_to_string(&path).ok();
+    if existing.as_deref() == Some(workflow_content) {
+        println!("    workflow@{dir}:{branch}: already installed");
+        return Ok(());
+    }
+    if dry_run {
+        println!(
+            "    workflow@{dir}:{branch}: would {} {WORKFLOW_PATH}",
+            if existing.is_some() {
+                "update"
+            } else {
+                "create"
+            }
+        );
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, workflow_content)?;
+    println!(
+        "    workflow@{dir}:{branch}: {} — commit and promote it yourself",
+        if existing.is_some() {
             "updated"
         } else {
             "created"
@@ -417,10 +574,10 @@ fn ensure_ruleset(owner: &str, repo: &str, desired: &Value, dry_run: bool) -> Re
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let args = parse_args()?;
+pub fn run(argv: &[String]) -> Result<i32> {
+    let args = parse_args(argv)?;
     let policy = load_policy(None)?;
-    let workflow_content = include_str!("../../.github/workflows/sig-check.yml");
+    let workflow_content = include_str!("../.github/workflows/sig-check.yml");
     let merge_settings: Value = serde_json::from_str(MERGE_SETTINGS)?;
     let repos = list_repos(&args)?;
     println!(
@@ -429,7 +586,14 @@ fn main() -> Result<()> {
         args.enforcement,
         if args.dry_run { " (dry-run)" } else { "" }
     );
-    let mut failures = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (dir, branch) in &args.local_refs {
+        if let Err(e) = ensure_workflow_local(dir, branch, workflow_content, args.dry_run) {
+            failures.push(format!("{dir}:{branch}"));
+            println!("  {dir}:{branch}: FAILED: {e:#}");
+        }
+    }
+    let mut pending = Vec::new();
     for full in &repos {
         let (owner, repo) = full
             .split_once('/')
@@ -440,26 +604,94 @@ fn main() -> Result<()> {
             continue;
         }
         println!("  {full}:");
-        let run = || -> Result<()> {
+        // Returns Ok(true) while an install PR still has to merge before the
+        // required check can activate — pending is not a failure.
+        let run = || -> Result<bool> {
             // Tag protection lands before the workflow update. On an upgrade
             // path this preserves any older workflow that still scanned tag
             // pushes; on a first install a failure here simply means nothing
             // is deployed yet — either way the run must report the repo as
             // not fully protected rather than claim a partial success.
             ensure_ruleset(owner, repo, &ruleset_tags(&args.enforcement), args.dry_run)?;
-            ensure_workflow(owner, repo, workflow_content, args.dry_run)?;
+            // The workflow file is the only object that lives inside a
+            // branch, so it only goes where the operator explicitly names
+            // it: --install-refs (repo, branch) pairs, each a direct commit.
+            // Everything else — promotion into protected branches, pull
+            // requests — belongs to the operator's own pipeline, and a
+            // refused write fails the repo rather than improvising.
+            let repo_refs: Vec<&str> = args
+                .install_refs
+                .iter()
+                .filter(|(r, _)| r == full)
+                .map(|(_, b)| b.as_str())
+                .collect();
+            if repo_refs.is_empty() {
+                println!("    workflow: not requested (no --install-refs for this repo)");
+            } else {
+                for target in &repo_refs {
+                    ensure_workflow_ref(owner, repo, target, workflow_content, args.dry_run)?;
+                }
+            }
             ensure_ruleset(
                 owner,
                 repo,
                 &ruleset_deny_trailers(&args.enforcement, &policy),
                 args.dry_run,
             )?;
-            ensure_ruleset(
-                owner,
-                repo,
-                &ruleset_default_branch(&args.enforcement),
-                args.dry_run,
-            )?;
+            // Protected branches are named explicitly, same tuple model as
+            // install-refs: the pull_request gate lands on every named
+            // branch now, while the check ruleset only covers branches that
+            // already carry the workflow file — requiring a check nothing
+            // produces would deadlock merges into that branch.
+            let protect_refs: Vec<&str> = args
+                .protect_refs
+                .iter()
+                .filter(|(r, _)| r == full)
+                .map(|(_, b)| b.as_str())
+                .collect();
+            let mut awaiting = Vec::new();
+            if protect_refs.is_empty() {
+                println!("    protected branches: none named (no --protect-refs for this repo)");
+            } else {
+                let mut gated = Vec::new();
+                for branch in &protect_refs {
+                    api(
+                        "GET",
+                        &format!("/repos/{owner}/{repo}/git/ref/heads/{branch}"),
+                        None,
+                    )
+                    .with_context(|| format!("protected branch {branch} not found"))?;
+                    if workflow_file(owner, repo, Some(branch))?.is_some()
+                        || (args.dry_run && repo_refs.contains(branch))
+                    {
+                        gated.push(*branch);
+                    } else {
+                        awaiting.push(*branch);
+                    }
+                }
+                ensure_ruleset(
+                    owner,
+                    repo,
+                    &ruleset_protected(&args.enforcement, &protect_refs),
+                    args.dry_run,
+                )?;
+                if gated.is_empty() {
+                    println!(
+                        "    ruleset clean-your-attribution-check: skipped — no protected \
+                         branch carries the workflow yet"
+                    );
+                } else {
+                    ensure_ruleset(
+                        owner,
+                        repo,
+                        &ruleset_check(&args.enforcement, &gated),
+                        args.dry_run,
+                    )?;
+                }
+                for branch in &awaiting {
+                    println!("    check@{branch}: deferred until the workflow lands there");
+                }
+            }
             if args.dry_run {
                 println!("    settings: would enforce squash-only + PR title");
             } else {
@@ -470,33 +702,71 @@ fn main() -> Result<()> {
                 )?;
                 println!("    settings: squash-only + PR title");
             }
-            Ok(())
+            Ok(!awaiting.is_empty())
         };
-        if let Err(e) = run() {
-            failures.push(full.clone());
-            println!("    FAILED: {e:#}");
-            println!(
-                "    repo NOT fully protected — an interrupted rollout can leave it \
-                 partly enrolled; rerun cya-apply before treating it as covered"
-            );
+        match run() {
+            Err(e) => {
+                failures.push(full.clone());
+                println!("    FAILED: {e:#}");
+                println!(
+                    "    repo NOT fully protected — an interrupted rollout can leave it \
+                     partly enrolled; rerun cya apply before treating it as covered"
+                );
+            }
+            Ok(true) => {
+                pending.push(full.clone());
+                println!(
+                    "    pending: protected branches without the workflow get their check \
+                     once the file lands — carry it there through your own path, then rerun"
+                );
+            }
+            Ok(false) => {}
         }
+    }
+    if !pending.is_empty() {
+        println!(
+            "{} repo(s) awaiting the workflow on protected branches \
+             (rerun after it lands): {}",
+            pending.len(),
+            pending.join(", ")
+        );
     }
     if failures.is_empty() {
         println!("done");
+        Ok(0)
     } else {
         println!(
             "done with {} failure(s): {}",
             failures.len(),
             failures.join(", ")
         );
-        std::process::exit(1);
+        Ok(1)
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ruleset_tags;
+    use super::{ruleset_check, ruleset_protected, ruleset_tags};
+
+    #[test]
+    fn protection_rulesets_scope_only_named_branches() {
+        let branches = ["release", "stable"];
+        let prot = ruleset_protected("active", &branches);
+        assert_eq!(
+            prot["conditions"]["ref_name"]["include"],
+            serde_json::json!(["refs/heads/release", "refs/heads/stable"])
+        );
+        assert_eq!(prot["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(prot["rules"][0]["type"], "pull_request");
+        let check = ruleset_check("active", &branches[..1]);
+        assert_eq!(
+            check["conditions"]["ref_name"]["include"],
+            serde_json::json!(["refs/heads/release"])
+        );
+        assert_eq!(check["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(check["rules"][0]["type"], "required_status_checks");
+        assert_eq!(check["bypass_actors"], serde_json::json!([]));
+    }
 
     #[test]
     fn tag_ruleset_is_fail_closed() {

@@ -17,7 +17,7 @@ tested; the rollout tool builds, but the fleet has not been applied yet.
 | --- | --- | --- |
 | `cya` binary | scans or rewrites commit messages, stripping denied trailers; installs repo hooks; switches local agents' own attribution options off | any machine — yours or a collaborator's, a single static binary |
 | `sig-check.yml` workflow | scans the PR/merge-group commit range, default-branch push ranges, plus PR title and body | GitHub Actions, referenced by repo rulesets as a required check |
-| `cya-apply` binary | installs the workflow, three rulesets, and squash-only merge settings in every targeted repo | run by an operator locally |
+| `cya apply` | installs the workflow, three rulesets, and squash-only merge settings in every targeted repo — remote or a local checkout | run by an operator locally |
 
 All three resolve from the same source of truth: `policy/trailers.json`,
 which is compiled into the binaries at build time.
@@ -25,7 +25,7 @@ which is compiled into the binaries at build time.
 ## Build and use
 
 ```sh
-cargo build --release --bins          # produces target/release/cya + cya-apply
+cargo build --release --bins          # produces target/release/cya
 cargo install --path . --bin cya      # or install it
 
 cya scan                              # scan the commits you are about to push
@@ -69,7 +69,8 @@ the agent itself is present.
 and `workflow_call` triggers. A consumer repository installs it once under
 `.github/workflows/clean-your-attribution.yml`; the rulesets then refuse pushes
 whose commit messages match the deny pattern and require the workflow's
-`attribution scan` check on the default branch. Merges are squash-only with
+`attribution scan` check on each protected branch the operator names.
+Merges are squash-only with
 the PR title as the sole commit-message source, so trailers in a dirty
 branch cannot reach the default branch's history.
 
@@ -85,14 +86,58 @@ The workflow provisions the `cya` binary from this repository's release
 assets for the runner's OS/arch, falling back to `cargo install --git`
 until releases exist.
 
-`cya-apply` applies all of that across organizations and accounts:
+`cya apply` rolls all of that out across organizations and accounts:
 
 ```sh
-cya-apply --orgs ORG1,ORG2 --users OWNER --dry-run
-cya-apply --orgs ORG1,ORG2 --users OWNER --enforcement evaluate
+cya apply --orgs ORG1,ORG2 --users OWNER --dry-run
+cya apply --orgs ORG1,ORG2 --users OWNER --enforcement evaluate
 ```
 
-Credentials come from `GITHUB_TOKEN` if set, else `gitvault api`.
+The workflow file is the one object that lives inside a branch, so it
+only goes where you explicitly name it — `--install-refs` takes
+`owner/repo:branch` pairs and direct-commits the file onto each named
+branch, nothing else:
+
+```sh
+cya apply --repos owner/repo --install-refs owner/repo:nightly
+```
+
+The tool never creates branches or pull requests and never falls back to
+a different ref: a target that refuses the write fails the run, and
+getting the file into a protected branch — promotion PRs, channel
+trains — is the operator's own pipeline.
+
+Which branches merges are gated on is a second explicit declaration —
+`--protect-refs` takes the same `owner/repo:branch` pairs:
+
+```sh
+cya apply --repos owner/repo \
+  --install-refs owner/repo:nightly \
+  --protect-refs owner/repo:release,owner/repo:stable
+```
+
+For a promotion-model repo the file enters locally instead:
+`--local PATH:branch` verifies the checkout is on the named branch (it
+never switches branches) and writes the file into the worktree for you to
+commit and promote yourself:
+
+```sh
+cya apply --repos owner/repo \
+  --local path/to/checkout:nightly \
+  --protect-refs owner/repo:release,owner/repo:stable
+```
+
+Every named branch gets the pull_request gate immediately. The required
+`attribution scan` check joins each branch only once the workflow file
+exists there — a `pull_request` event runs the base branch's copy, so
+requiring it where no file exists would deadlock the very merge meant to
+carry the file in. Branches still waiting are reported pending: land the
+file through your normal path and rerun `cya apply`. Repos named by
+either flag join the rollout automatically; a repo with neither gets the
+deny/tag rulesets and merge settings only.
+
+Credentials come from `GITHUB_TOKEN` if set, else `gh api` (any `gh`
+with GitHub API access — the GitHub CLI or a compatible shim).
 
 ## Verify
 
