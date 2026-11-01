@@ -136,21 +136,29 @@ explicitly named — nothing is scoped implicitly:
 - **`--protect-refs owner/repo:branch`**: `clean-your-attribution-protected`
   requires a pull request on every named branch immediately, and
   `clean-your-attribution-check` requires the `attribution scan` check
-  on each named branch that already carries the workflow file. A named
-  branch without the file is *pending* — the check joins it on the next
-  apply run once the file lands, never before: requiring a check no
-  branch produces would deadlock the merge meant to carry the file in.
+  on each named branch that already carries the workflow file. While
+  *no* named branch carries the file, the check ruleset is installed
+  `disabled` — not absent — because a live check-scoped ruleset on
+  fileless branches would deadlock the very merge meant to carry the
+  file back. Once the file lands on a named branch, the next apply run
+  PUTs the ruleset `active` scoped at the branches that produce the
+  check; a named branch still without the file stays out of its scope.
 
 Reconciliation is explicit opt-in: a run creates and updates only, and
-every tool-owned ruleset outside the declared set is *warned* about
-(`stale — rerun with --prune`). With `--prune`, the declared set is the
-whole story — each stale managed ruleset is deleted and the removal
-printed: a `check` gate whose named branches no longer carry the file,
-a `protected` set the operator stopped naming, and the superseded
-pre-0.2.0 `clean-your-attribution-default` ruleset. A partial rerun —
-a policy refresh naming no refs — can therefore never silently strip
-gates it did not restate; only `includes_parents=false` repo-owned
-rulesets are ever in scope.
+every tool-owned ruleset outside the declared set is *warned* about and
+counted — the run footer names the leftover and the exit code reports
+it. With `--prune`, the declared set is the whole story — each stale
+managed ruleset is deleted and the removal printed: a `protected` set
+the operator stopped naming, and the superseded pre-0.2.0
+`clean-your-attribution-default` ruleset. A partial rerun — a policy
+refresh naming no refs — can therefore never silently strip gates it
+did not restate; only `includes_parents=false` repo-owned rulesets are
+ever in scope.
+
+Exit codes: `0` the declared state fully landed; `1` one or more repos
+failed; `3` the run succeeded but left stale tool-owned rulesets
+enforcing — rerun with `--prune`. (`2` is the CLI's usage-error status,
+unchanged.)
 
 ## Resolution order
 

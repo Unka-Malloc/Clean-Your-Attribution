@@ -86,9 +86,10 @@ The workflow provisions the `cya` binary from the published crates.io
 package — the maximum stable (non-yanked) version the sparse index
 resolves is pinned and logged per run, the build is `--locked`, and the
 compiled binary is cached per version. A failed registry install falls
-back to a tag-pinned `cargo install --git`; an unresolvable index
-(nothing published yet, or an outage) falls back to building the
-repository HEAD, and the run says so plainly either way.
+back to a tag-pinned `cargo install --git`. An unresolvable index
+(nothing published yet, or an outage) builds the repository HEAD —
+but only in this repository's own pre-publication runs; a consumer
+repository's run fails closed rather than float off its pin.
 
 `cya apply` rolls all of that out across organizations and accounts:
 
@@ -135,16 +136,22 @@ Every named branch gets the pull_request gate immediately. The required
 `attribution scan` check joins each branch only once the workflow file
 exists there — a `pull_request` event runs the base branch's copy, so
 requiring it where no file exists would deadlock the very merge meant to
-carry the file in. Branches still waiting are reported pending: land the
-file through your normal path and rerun `cya apply`. Repos named by
-either flag join the rollout automatically; a repo with neither gets the
+carry the file in. While no named branch carries the file yet, the check
+ruleset is installed `disabled` — a live one would be that same
+deadlock — and the next apply run activates it once a branch can produce
+the check. Branches still waiting are reported pending: land the file
+through your normal path and rerun `cya apply`. Repos named by either
+flag join the rollout automatically; a repo with neither gets the
 deny/tag rulesets and merge settings only.
 
 A run creates and updates — it never deletes. Tool-owned rulesets
 outside the declared set (a branch the operator stopped naming, the
 superseded `clean-your-attribution-default` ruleset) are reported
-`stale` until `--prune` is given, which deletes each one and prints the
-removal — so a partial rerun can never silently strip gates.
+`stale`, counted in the footer and surfaced as exit code 3 until
+`--prune` is given, which deletes each one and prints the removal — so
+a partial rerun can never silently strip gates. Exit codes: `0` clean,
+`1` repo failure(s), `3` stale rulesets left (`2` is the usage-error
+status).
 
 Credentials come from `GITHUB_TOKEN` if set, else `gh api` (any `gh`
 with GitHub API access — the GitHub CLI or a compatible shim).

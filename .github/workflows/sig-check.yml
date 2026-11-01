@@ -5,12 +5,14 @@ name: clean-your-attribution
 #   ruleset "Require workflows to pass" rule — no per-repo caller needed.
 # - workflow_call: can be reused by a thin caller file in repositories where
 #   ruleset workflow references are unavailable.
-# The cya binary is provisioned from the published crates.io package,
-# pinned to the version the sparse index resolves for this run (logged —
-# "what scanned this commit" is answerable from the run output) and built
-# --locked, with a tag-pinned `cargo install --git` as the pre-release
-# fallback. The resolved binary is cached per version, so warm runs skip
-# the compile entirely. The policy travels inside the binary.
+# The cya binary is provisioned from the published crates.io package:
+# the maximum stable version the sparse index resolves is pinned and
+# logged per run ("what scanned this commit" is answerable from the run
+# output), built --locked, and cached per version so warm runs skip the
+# compile. A failed registry install falls back to the same version's
+# tag; an unresolvable index falls back to building HEAD — but only for
+# this repository's own pre-publication runs; consumers fail closed.
+# The policy travels inside the binary.
 
 on:
   workflow_call:
@@ -68,13 +70,16 @@ jobs:
       - name: Resolve the published cya version
         id: cya-version
         run: |
-          # Every index record is judged: yanked entries are dropped and the
-          # maximum stable semver wins, so a backported patch published after
-          # the newest release cannot steal the pin. An unresolvable index
-          # emits an empty version — the provisioning step's unreleased path,
-          # not a dead run that leaves a required check red.
-          ver="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
-            https://index.crates.io/cl/ea/clean-your-attribution | python3 -c '
+          # Every index record is judged: yanked entries are dropped and
+          # the maximum semver wins — releases outrank prereleases and
+          # prerelease identifiers compare numeric-then-lexical — so a
+          # backported patch cannot steal the pin. The curl failure is
+          # tolerated on purpose (`|| true`): an unresolvable index emits
+          # an empty version, which is the provisioning step's explicit
+          # unreleased/fail-closed path, not a dead run.
+          index="$(curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 \
+            https://index.crates.io/cl/ea/clean-your-attribution || true)"
+          ver="$(printf '%s' "$index" | python3 -c '
           import json, re, sys
           versions = []
           for line in sys.stdin:
@@ -87,12 +92,21 @@ jobs:
                   continue
               versions.append(v)
           pool = [v for v in versions if "-" not in v] or versions
-          print(max(pool, key=lambda v: tuple(int(x) for x in v.split("-")[0].split("."))) if pool else "")
+          def key(v):
+              main, _, pre = v.partition("-")
+              nums = tuple(int(x) for x in main.split("."))
+              prekey = tuple((0, int(x)) if x.isdigit() else (1, x)
+                             for x in pre.split(".")) if pre else ((2,),)
+              return (nums, prekey)
+          print(max(pool, key=key) if pool else "")
           ')"
           echo "resolved cya ${ver:-<none — unreleased path>}"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
+      # Keyed on the resolved release: an unresolvable index must not
+      # restore a binary cached under a different name.
       - name: Cache the cya binary
+        if: steps.cya-version.outputs.version != ''
         id: cya-bin
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -119,12 +133,17 @@ jobs:
           if [ -x ~/.cargo/bin/cya ]; then
             echo "cached cya $CYA_VERSION"
           elif [ -z "$CYA_VERSION" ]; then
-            # Unreleased path: the index could not name a version (nothing
-            # published yet, or an index outage) — the crate's own Git tree
-            # is the only source left, and the run says so.
-            echo "no published version resolved — building unreleased HEAD from source"
-            cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
-              --locked --bin cya
+            if [ "${{ github.repository }}" = "Unka-Malloc/Clean-Your-Attribution" ]; then
+              # Unreleased path: the index could not name a version —
+              # only this repository's own pre-publication runs may
+              # build HEAD; a consumer never floats off its pin.
+              echo "no published version resolved — building unreleased HEAD from source"
+              cargo install --git https://github.com/Unka-Malloc/Clean-Your-Attribution \
+                --locked --bin cya
+            else
+              echo "cya version unresolvable — the crates.io index is unreachable or names no usable release; failing closed" >&2
+              exit 1
+            fi
           elif ! cargo install "clean-your-attribution@${CYA_VERSION}" \
                 --locked --bin cya; then
             # Pre-release fallback: the same version's tag, never a

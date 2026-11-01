@@ -12,7 +12,17 @@
 //! ruleset unless `--prune` is given, under which every tool-owned
 //! ruleset outside the declared set (stale `-protected`/`-check`, the
 //! superseded `-default` name) is deleted and each removal printed.
-//! Without `--prune` the same stale objects are warned about instead.
+//! Without `--prune` the same stale objects are warned about, counted in
+//! the footer, and reported as exit 3 — the run is honest about the
+//! enforcement it left behind. One repair is unconditional rather than
+//! pruned: a `check` ruleset live on branches that cannot produce the
+//! check (named protected branches with no workflow yet) is PUT
+//! `disabled` — leaving it enforcing would deadlock the merge meant to
+//! carry the file back, which is a self-inflicted broken state, not a
+//! declaration question.
+//!
+//! Exit: 0 declared state landed; 1 repo failure(s); 3 stale rulesets
+//! left enforcing (rerun with --prune).
 //!
 //! The tool never opens branches or pull requests and never guesses where
 //! anything belongs: `--install-refs` names (repo, branch) pairs that get
@@ -376,19 +386,32 @@ const MERGE_SETTINGS: &str = r#"{
 /// longer writes stays managed, so a rename cannot orphan a live gate.
 const MANAGED_RULESETS: [&str; 5] = [RS_DENY, RS_TAGS, RS_PROTECTED, RS_CHECK, RS_LEGACY_DEFAULT];
 
-/// The ruleset set a repo should end with: deny + tags always, the
-/// pull_request gate once branches are named, and the required check
-/// only while a named branch already carries the workflow file — an
-/// empty gated set would install a check nothing can produce.
-fn desired_rulesets(protected_named: bool, gated_nonzero: bool) -> Vec<&'static str> {
+/// The ruleset set a repo should end with: deny + tags always, and once
+/// protected branches are named, the pull_request gate plus the check
+/// ruleset — `disabled` is the check's deferred state while no named
+/// branch can produce it, so the ruleset itself is always desired and
+/// never appears in the stale set.
+fn desired_rulesets(protected_named: bool) -> Vec<&'static str> {
     let mut names = vec![RS_DENY, RS_TAGS];
     if protected_named {
         names.push(RS_PROTECTED);
-        if gated_nonzero {
-            names.push(RS_CHECK);
-        }
+        names.push(RS_CHECK);
     }
     names
+}
+
+/// Exit-code mapping, pure so the precedence is testable: real repo
+/// failures always dominate (1); a run that left stale tool-owned
+/// rulesets enforcing reports 3 (2 is this CLI's usage-error status);
+/// 0 means the declared state fully landed.
+fn apply_exit(failures: usize, stale_left: usize) -> i32 {
+    if failures > 0 {
+        1
+    } else if stale_left > 0 {
+        3
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------- apply --
@@ -621,14 +644,6 @@ fn stale_rulesets<'a>(list: &'a [Value], desired: &[&str]) -> Vec<(&'a str, i64)
         .collect()
 }
 
-/// Handles tool-owned rulesets the current declaration does not want —
-/// a stale `check` ruleset demands a check no branch can produce, which
-/// deadlocks the very merge meant to carry the file back, and a stale
-/// `protected` or superseded `-default` set enforces scopes the operator
-/// never named. Deletion only happens under `--prune`: removal is an
-/// explicit operator declaration, so a partial rerun (a policy refresh
-/// naming no refs) can never silently strip gates it did not restate.
-/// Without `--prune` each stale ruleset is warned about instead.
 /// Rows a repo-scoped run may touch: the listing asks the API for
 /// repo-owned objects (`includes_parents=false`), but the field check
 /// stays as the contract — an inherited organization ruleset sharing a
@@ -639,6 +654,12 @@ fn repo_owned(row: &Value) -> bool {
     row.get("source_type").and_then(Value::as_str) == Some("Repository")
 }
 
+/// Handles tool-owned rulesets the current declaration does not want.
+/// Deletion only happens under `--prune`: removal is an explicit
+/// operator declaration, so a partial rerun (a policy refresh naming
+/// no refs) can never silently strip gates it did not restate.
+/// Without `--prune` each stale ruleset is warned about and counted —
+/// the run's footer and exit code say enforcement was left behind.
 fn reconcile_rulesets(
     owner: &str,
     repo: &str,
@@ -796,19 +817,24 @@ pub fn run(argv: &[String]) -> Result<i32> {
                     &ruleset_protected(&args.enforcement, &protect_refs),
                     args.dry_run,
                 )?;
+                // The check ruleset's desired state is unconditional once
+                // protected branches are named: active on the branches
+                // that can produce the check, disabled while none can. A
+                // live -check scoped at fileless branches would demand a
+                // check that cannot run and deadlock the merge meant to
+                // carry the file back — repairing that self-inflicted
+                // state is not a --prune question.
+                let check_state = if gated.is_empty() {
+                    ruleset_check("disabled", &protect_refs)
+                } else {
+                    ruleset_check(&args.enforcement, &gated)
+                };
+                ensure_ruleset(owner, repo, &rulesets, &check_state, args.dry_run)?;
                 if gated.is_empty() {
                     println!(
-                        "    ruleset {RS_CHECK}: skipped — no protected \
+                        "    ruleset {RS_CHECK}: disabled — no protected \
                          branch carries the workflow yet"
                     );
-                } else {
-                    ensure_ruleset(
-                        owner,
-                        repo,
-                        &rulesets,
-                        &ruleset_check(&args.enforcement, &gated),
-                        args.dry_run,
-                    )?;
                 }
                 for branch in &awaiting {
                     println!("    check@{branch}: deferred until the workflow lands there");
@@ -823,7 +849,7 @@ pub fn run(argv: &[String]) -> Result<i32> {
                 owner,
                 repo,
                 &rulesets,
-                &desired_rulesets(!protect_refs.is_empty(), !gated.is_empty()),
+                &desired_rulesets(!protect_refs.is_empty()),
                 args.dry_run,
                 args.prune,
             )?;
@@ -880,20 +906,18 @@ pub fn run(argv: &[String]) -> Result<i32> {
             failures.len(),
             failures.join(", ")
         );
-        Ok(1)
     } else if stale_left_total > 0 {
         println!("done (stale rulesets pending removal)");
-        Ok(2)
     } else {
         println!("done");
-        Ok(0)
     }
+    Ok(apply_exit(failures.len(), stale_left_total))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        desired_rulesets, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
+        apply_exit, desired_rulesets, repo_owned, ruleset_check, ruleset_protected, ruleset_tags,
         stale_rulesets, MANAGED_RULESETS,
     };
     use serde_json::json;
@@ -942,19 +966,14 @@ mod tests {
         // -protected/-check set or the superseded -default ruleset gets
         // reconciled away rather than left enforcing unnamed scopes.
         assert_eq!(
-            desired_rulesets(false, false),
+            desired_rulesets(false),
             ["clean-your-attribution", "clean-your-attribution-tags"]
         );
+        // Protected branches named: the check ruleset is desired too —
+        // `disabled` is its deferred state while no named branch can
+        // produce the check, so it never lands in the stale set.
         assert_eq!(
-            desired_rulesets(true, false),
-            [
-                "clean-your-attribution",
-                "clean-your-attribution-tags",
-                "clean-your-attribution-protected"
-            ]
-        );
-        assert_eq!(
-            desired_rulesets(true, true),
+            desired_rulesets(true),
             [
                 "clean-your-attribution",
                 "clean-your-attribution-tags",
@@ -962,19 +981,25 @@ mod tests {
                 "clean-your-attribution-check"
             ]
         );
-        // The check gate can never be desired without protected branches,
-        // and the legacy default-branch name is never desired at all.
-        for desired in [
-            desired_rulesets(false, false),
-            desired_rulesets(true, false),
-            desired_rulesets(true, true),
-        ] {
+        // The legacy default-branch name is never desired at all.
+        for desired in [desired_rulesets(false), desired_rulesets(true)] {
             assert!(!desired.contains(&"clean-your-attribution-default"));
             for name in &desired {
                 assert!(MANAGED_RULESETS.contains(name));
             }
         }
         assert!(MANAGED_RULESETS.contains(&"clean-your-attribution-default"));
+    }
+
+    #[test]
+    fn apply_exit_precedence() {
+        assert_eq!(apply_exit(0, 0), 0);
+        // Stale rulesets left enforcing get their own status — 2 is the
+        // CLI's usage-error code and must stay unambiguous.
+        assert_eq!(apply_exit(0, 1), 3);
+        // Failures dominate a stale remainder.
+        assert_eq!(apply_exit(2, 4), 1);
+        assert_eq!(apply_exit(1, 0), 1);
     }
 
     #[test]
@@ -999,7 +1024,7 @@ mod tests {
             json!({"name": "someone-elses", "id": 4}),
             json!({"id": 5}),
         ];
-        let desired = desired_rulesets(false, false);
+        let desired = desired_rulesets(false);
         let stale = stale_rulesets(&list, &desired);
         assert_eq!(
             stale,
@@ -1009,7 +1034,7 @@ mod tests {
             ]
         );
         // A desired managed name is never stale, even mid-list.
-        let desired = desired_rulesets(true, true);
+        let desired = desired_rulesets(true);
         assert!(stale_rulesets(&list, &desired)
             .iter()
             .all(|(n, _)| *n == "clean-your-attribution-default"));
