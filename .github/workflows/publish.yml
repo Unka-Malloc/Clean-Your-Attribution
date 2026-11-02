@@ -25,6 +25,10 @@ concurrency:
 jobs:
   crates:
     runs-on: ubuntu-latest
+    # A no-compile package+publish needs minutes, not the 360-minute job
+    # default: a black-holed endpoint must fail fast, not hold the
+    # release's concurrency slot for six hours.
+    timeout-minutes: 10
     environment: release
     permissions:
       contents: read
@@ -39,23 +43,12 @@ jobs:
         with:
           persist-credentials: false
 
-      # The `release` environment's protection rules are the operator's
-      # approval gate. Naming the environment is not enough — GitHub
-      # auto-creates a missing environment with no rules at all, so the
-      # job fails closed unless a required-reviewer rule with at least
-      # one reviewer is actually configured.
-      - name: Require release-environment approval
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          reviewers=$(gh api "repos/$GITHUB_REPOSITORY/environments/release" \
-            --jq '[.protection_rules[] | select(.type == "required_reviewers")
-                   | (.reviewers // [])[]] | length')
-          test "$reviewers" -gt 0 || {
-            echo "the release environment has no required-reviewer rule" >&2
-            exit 1
-          }
-
+      # The `release` environment's required-reviewers rule is the
+      # operator's approval gate: GitHub enforces it when the job claims
+      # the environment. Configuring that rule — Settings → Environments →
+      # release → Required reviewers — is a documented operator
+      # precondition; the token in this job cannot read protection rules,
+      # so a CI-side re-check could never prove it anyway.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # An isolated cargo home keeps a candidate .cargo/config.toml — a
@@ -112,7 +105,8 @@ jobs:
             3) idx="3/${name:0:1}/$name";;
             *) idx="${name:0:2}/${name:2:2}/$name";;
           esac
-          if curl -fsSL "https://index.crates.io/$idx" | grep -q "\"vers\":\"$vers\""; then
+          if curl -fsSL --connect-timeout 10 --max-time 30 \
+               "https://index.crates.io/$idx" | grep -q "\"vers\":\"$vers\""; then
             echo "$name $vers is already on crates.io — skipping"
             exit 0
           fi
