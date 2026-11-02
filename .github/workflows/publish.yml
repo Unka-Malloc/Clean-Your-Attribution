@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 10
     environment: release
     permissions:
+      actions: read
       contents: read
       id-token: write
     env:
@@ -44,11 +45,24 @@ jobs:
           persist-credentials: false
 
       # The `release` environment's required-reviewers rule is the
-      # operator's approval gate: GitHub enforces it when the job claims
-      # the environment. Configuring that rule — Settings → Environments →
-      # release → Required reviewers — is a documented operator
-      # precondition; the token in this job cannot read protection rules,
-      # so a CI-side re-check could never prove it anyway.
+      # operator's approval gate — configuring it is a documented
+      # provisioning precondition. GITHUB_TOKEN cannot read protection
+      # rules, so the gate proves itself from this run's record instead:
+      # an enforced deployment leaves at least one approvals entry; an
+      # auto-created or unprotected environment lets this job start with
+      # none and fails here, before any authentication runs.
+      - name: Require the recorded release approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          approvals=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            --jq 'length')
+          test "$approvals" -gt 0 || {
+            echo "no release-environment approval is on record for this run" >&2
+            exit 1
+          }
+
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       # An isolated cargo home keeps a candidate .cargo/config.toml — a

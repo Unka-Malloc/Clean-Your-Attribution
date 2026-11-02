@@ -58,11 +58,14 @@ skip without re-uploading.
 The job holds no stored credential: it exchanges a GitHub OIDC token for
 a short-lived crates.io token through crates.io Trusted Publishing, and
 that exchange is bound to this workflow file, this repository, and the
-`release` GitHub environment. Deployment under that environment only
-proceeds after its required-reviewer protection approves, and the job
-itself re-verifies the rule exists — a missing or unprotected
-environment fails closed, as does a release tag that does not equal
-`v<Cargo.toml version>` — checked before any authentication runs.
+`release` GitHub environment. The environment must carry a
+required-reviewers rule — a documented provisioning precondition —
+and GitHub itself enforces it before this job starts. The job's own
+token cannot read protection rules, so it instead refuses to run
+unless this run's deployment record shows at least one approval: a
+missing or unprotected environment lets the job start with no
+approvals on record and it fails closed before any authentication,
+as does a release tag that does not equal `v<Cargo.toml version>`.
 
 Trust basis, stated plainly: the `.crate` is packaged by a GitHub-hosted
 runner from the tagged commit under an environment-scoped OIDC identity;
