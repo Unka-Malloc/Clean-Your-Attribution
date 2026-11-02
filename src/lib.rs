@@ -162,6 +162,35 @@ pub fn validate_against_preset(effective: &Policy) -> Result<()> {
     Ok(())
 }
 
+/// The bounded-fetch argv for the optional policy endpoint: a stalled
+/// endpoint must not hold a billed runner for the job budget - connect,
+/// per-attempt and retry caps keep the fetch a seconds-scale operation,
+/// and the retry budget itself is capped so the worst case is about a
+/// minute (the 45 s retry budget plus one final 20 s attempt). Extracted
+/// as a pure helper so the bounds are pinned by a test, not by review
+/// alone.
+fn curl_bounded_fetch_args(url: &str) -> Vec<String> {
+    [
+        "-fsSL",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "20",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+        "--retry-max-time",
+        "45",
+        url,
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect()
+}
+
 /// Policy resolution: `--policy-url` / `CYA_POLICY_URL` first (lets a fleet
 /// update rules without reinstalling), else the compile-time-embedded file.
 /// Every source — bundled included — must cover the bundled preset floor.
@@ -178,7 +207,7 @@ pub fn load_policy(policy_url: Option<&str>) -> Result<Policy> {
             "policy URL must be https: {url}"
         );
         let out = Command::new("curl")
-            .args(["-fsSL", "--proto-redir", "=https", &url])
+            .args(curl_bounded_fetch_args(&url))
             .output()
             .context("failed to launch curl")?;
         ensure!(out.status.success(), "policy fetch failed: {url}");
@@ -1088,5 +1117,25 @@ mod tests {
         let p = parse_policy(&keyed.to_string(), "t").unwrap();
         let e = validate_against_preset(&p).unwrap_err().to_string();
         assert!(e.contains("co-authored-by"), "{e}");
+    }
+
+    /// The policy fetch's cost bound is safety-relevant for billed
+    /// runners: the argv pins connect, per-attempt and total retry caps
+    /// so no edit can quietly reintroduce an unbounded fetch.
+    #[test]
+    fn policy_fetch_argv_is_bounded() {
+        let args = curl_bounded_fetch_args("https://example.test/p.json");
+        assert_eq!(args.last().unwrap(), "https://example.test/p.json");
+        for (flag, value) in [
+            ("--connect-timeout", "5"),
+            ("--max-time", "20"),
+            ("--retry", "3"),
+            ("--retry-delay", "2"),
+            ("--retry-max-time", "45"),
+        ] {
+            let at = args.iter().position(|a| a == flag).unwrap();
+            assert_eq!(args[at + 1], value, "{flag}");
+        }
+        assert!(args.contains(&"=https".to_string()), "redirects stay https");
     }
 }

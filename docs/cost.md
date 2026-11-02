@@ -14,9 +14,9 @@ runner job (`ubuntu-latest`) per attribution-relevant event.
 | Trigger volume | One job per `pull_request` or `merge_group` event, and per `push` event on the repository's default branch (other-branch pushes and tag pushes are skipped in seconds — branches are covered at PR time and tags are gated by a tag ruleset, not a workflow); bounded by human commit activity; no schedules, no matrix, single job | this workflow |
 | `workflow_call` volume | Caller-defined — the workflow is also reusable; each calling repo's triggers determine its frequency (same per-run cost) | this workflow `on:` block |
 | Per-run wall time | ~5 s when the version-keyed binary cache hits (resolve + scan only); ~60–90 s on a cold run — every version change pays one compile per runner image (`cargo build --release` ≈ 40 s clean locally, plus dependency builds on a cold registry cache). Unresolved-index path (this repository's own pre-publication runs only): no binary cache, one cold HEAD compile per run — consumer runs fail closed in the resolve step instead, before any cache restore | this workflow; local build measured |
-| Network per run, cached | One repo fetch (`fetch-depth: 0`, ≈ 1 MB git data at current size) + one sparse-index line for version resolution (bytes) + one binary cache restore (≈ 2 MB) + optional policy fetch only if `CYA_POLICY_URL` is set (single HTTPS GET) | this workflow |
+| Network per run, cached | One repo fetch (`fetch-depth: 0`, ≈ 1 MB git data at current size) + one sparse-index line for version resolution (bytes) + one binary cache restore (≈ 2 MB) + optional policy fetch only if `CYA_POLICY_URL` is set — exactly one fetch per scan invocation: a single HTTPS GET retried up to 3 times (5 s connect, 20 s per-attempt, 2 s retry delay, 45 s total retry budget — worst case ≈ 65 s including the final attempt) | this workflow |
 | Network per run, cold | The cached traffic plus the `.crate` and dependency downloads `cargo install` performs — the `~/.cargo` registry cache makes repeat cold builds near-zero on the same version | this workflow |
-| Storage | No artifacts or deployments; two `actions/cache` entries — the `~/.cargo` registry and one `~/.cargo/bin/cya` per (version, OS, arch) — tens of MB within the repo's cache quota | this workflow |
+| Storage | No artifacts or deployments; two `actions/cache` entries **per (version, OS, arch)** — one `~/.cargo/bin/cya` binary (≈ 2 MB) plus a full `~/.cargo` registry + git snapshot (tens of MB). Cache entries are immutable and live under a **10 GB per-repository limit with 7-day retention**: entries a repository has not touched in 7 days are removed, and writes beyond the limit evict the least-recently-used entries — so the per-version snapshots this change adds cost eviction pressure and at most one extra ~60–90 s cold compile, **not a bill**. A run the scan refuses still saves both entries — saves are skipped only for a failed provision or when no resolved version exists to key an entry under. Branch/PR cache scoping can multiply entries within the repo's quota | this workflow; GitHub Docs — *Dependency caching reference* (10 GB limit, 7-day retention, LRU eviction) |
 
 Known cost trade-offs, all deliberate:
 
@@ -30,7 +30,14 @@ Known cost trade-offs, all deliberate:
   cold cache — the published-binary alternative would need a build
   matrix this repository deliberately does not operate. The
   version-keyed binary cache bounds the recurring cost to one compile
-  per release.
+  per release — restore and save are separate steps so a run the scan
+  refuses still banks the binary it built. The registry snapshot is
+  keyed the same way: `--locked` pins the dependency set to the resolved
+  version, so the version is the content key — and cache entries being
+  immutable means a versionless key could never refresh after its first
+  save. The trade is a fresh tens-of-MB registry snapshot per release
+  (plus the per-version binary), retained until the 7-day/LRU eviction —
+  the accepted storage cost of exact per-version dependency caching.
 
 ## CI (`ci.yml`)
 
@@ -84,7 +91,11 @@ what scanned a commit.
 ## Local CLI (`cya`)
 
 Single-shot processes: one `git log` read per scan, linear regex
-matching per commit, no daemons, no polling, no retry loops. `cya apply`
+matching per commit, no daemons, no polling. The optional policy fetch
+runs at most once per invocation: a single GET with up to 3 retries
+(5 s connect, 20 s per-attempt, 2 s delay, 45 s total retry budget —
+worst case ≈ 65 s for the one fetch, not a loop); everything else
+runs once. `cya apply`
 pages GitHub list endpoints at 100/page — the minimum request count the
 API allows — and stops on the first empty page. A dead-gate probe costs
 one ruleset-detail GET plus one read per literal scoped branch, issued

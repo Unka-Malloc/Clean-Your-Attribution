@@ -121,29 +121,46 @@ jobs:
             exit 1
           fi
 
+      # Restores and saves are split on purpose: the all-in-one cache action
+      # only saves when the job succeeds, and this job's blocking path is a
+      # failed scan — a refused repo would otherwise recompile ~60-90 s on
+      # every push. Saves run `if: always()` gated on a successful provision,
+      # so a compile failure never writes a partial cache entry.
       # Keyed on the resolved release: an unresolvable index must not
       # restore a binary cached under a different name.
-      - name: Cache the cya binary
+      # Invariant: this step's `path`/`key` must stay byte-identical to
+      # the binary save step's below — edit them together, or every run
+      # becomes a permanent cache miss that silently recompiles.
+      - name: Restore the cya binary
         if: steps.cya-version.outputs.version != ''
         id: cya-bin
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cya
           key: cya-bin-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
 
       # The registry restore is tens of MB — skip it when the binary itself
       # is already cached: nothing below consumes the registry on a warm run.
-      - name: Cache cargo registry
+      # The key turns over per version: `--locked` pins the dependency set to
+      # the resolved release, so the version IS the content key — and cache
+      # entries are immutable, so a key that omitted the version could never
+      # refresh after its first save. The restore prefix still lands the
+      # newest prior set for a version never built here.
+      # Same invariant as the binary pair: `path`/`key` must stay
+      # byte-identical to the registry save step's — edit them together.
+      - name: Restore cargo registry
         if: steps.cya-bin.outputs.cache-hit != 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: cya-registry
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cya-cargo-${{ runner.os }}-${{ runner.arch }}
+          key: cya-cargo-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
           restore-keys: cya-cargo-
 
       - name: Provision cya
+        id: provision
         env:
           CYA_VERSION: ${{ steps.cya-version.outputs.version }}
         run: |
@@ -178,3 +195,30 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | ~/.cargo/bin/cya scan --stdin
+
+      # Cache writes are housekeeping, never the check's verdict: they run
+      # after the scans under `always()` (a refused repo still banks the
+      # binary it built) and `continue-on-error`, so a transient cache
+      # failure can neither gate the scan nor replace its verdict. Each
+      # save needs a successful provision and its own exact-key miss: a
+      # failed or partial provision must never upload an incomplete entry —
+      # cache entries are immutable, so a partial save would poison every
+      # later same-version restore — and an exact-hit restored entry is
+      # never rewritten.
+      - name: Save the cya binary
+        if: always() && steps.cya-bin.outputs.cache-hit != 'true' && steps.provision.outcome == 'success' && steps.cya-version.outputs.version != ''
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cya
+          key: cya-bin-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Save cargo registry
+        if: always() && steps.cya-bin.outputs.cache-hit != 'true' && steps.cya-registry.outputs.cache-hit != 'true' && steps.provision.outcome == 'success' && steps.cya-version.outputs.version != ''
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cya-cargo-${{ steps.cya-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}

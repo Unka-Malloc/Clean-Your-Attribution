@@ -780,9 +780,9 @@ fn ensure_workflow_local(
     );
     if !declared.is_empty() {
         anyhow::ensure!(
-            slugs
+            slugs.iter().any(|slug| declared
                 .iter()
-                .any(|slug| declared.iter().any(|target| target.eq_ignore_ascii_case(slug))),
+                .any(|target| target.eq_ignore_ascii_case(slug))),
             "{dir}: checkout is not one of the declared repository targets"
         );
     }
@@ -1150,7 +1150,8 @@ pub fn run(argv: &[String]) -> Result<i32> {
         .collect();
     let mut failures: Vec<String> = Vec::new();
     for (dir, branch) in &args.local_refs {
-        if let Err(e) = ensure_workflow_local(dir, branch, workflow_content, &declared, args.dry_run)
+        if let Err(e) =
+            ensure_workflow_local(dir, branch, workflow_content, &declared, args.dry_run)
         {
             failures.push(format!("{dir}:{branch}"));
             println!("  {dir}:{branch}: FAILED: {e:#}");
