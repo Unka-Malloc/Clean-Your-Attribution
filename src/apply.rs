@@ -170,26 +170,67 @@ fn canonical_self(meta: &Value) -> bool {
         .is_some_and(is_self_repo)
 }
 
+/// GitHub's character set for one `owner/repo` segment: names, `.`, `-`
+/// and `_`, never `.`/`..` alone. Shared by spelled-target validation
+/// and remote-URL identity resolution.
+fn slug_segment_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// Split an `owner/repo` target into the two URL-bound segments. Anything
 /// beyond GitHub's own character set — a second `/`, a `.`/`..` segment,
 /// a percent escape, a `.git` suffix the server folds — is refused: the
 /// spelled name is exactly the target or the run stops, so normalization
 /// can never redirect a write past the self-protection guard.
 fn repo_slug_parts(slug: &str) -> Result<(&str, &str)> {
-    let segment_ok = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
     let msg = format!("bad repo name {slug} — targets resolve as spelled or not at all");
     let (owner, repo) = slug.split_once('/').context(msg.clone())?;
     anyhow::ensure!(
-        segment_ok(owner) && segment_ok(repo) && !repo.to_ascii_lowercase().ends_with(".git"),
+        slug_segment_ok(owner)
+            && slug_segment_ok(repo)
+            && !repo.to_ascii_lowercase().ends_with(".git"),
         "{msg}"
     );
     Ok((owner, repo))
+}
+
+/// Parse a git remote URL into its `owner/repo` slug — the https, ssh and
+/// scp-like spellings of github.com, with the conventional `.git` suffix
+/// stripped. Anything else — another host, a local path, a foldable or
+/// extra segment — yields `None`: it cannot establish repository
+/// identity, so it satisfies neither the self check nor a declared
+/// target match.
+fn github_slug(url: &str) -> Option<String> {
+    let path = url.strip_prefix("git@github.com:").or_else(|| {
+        url.strip_prefix("https://github.com/")
+            .or_else(|| url.strip_prefix("http://github.com/"))
+            .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+    })?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, repo) = path.split_once('/')?;
+    (slug_segment_ok(owner) && slug_segment_ok(repo)).then(|| format!("{owner}/{repo}"))
+}
+
+/// The repository slugs a checkout's `origin` names — every configured
+/// fetch/push URL parsed as a GitHub `owner/repo`. A checkout with no
+/// origin remote, or whose origin is not a clean github.com spelling,
+/// returns an empty list: its identity cannot be established, so it
+/// cannot pass a self check or match a declared repository target.
+fn remote_slugs(dir: &str) -> Result<Vec<String>> {
+    let out = Command::new("git")
+        .args(["-C", dir, "remote", "get-url", "--all", "origin"])
+        .output()
+        .with_context(|| format!("{dir}: cannot inspect the checkout"))?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8(out.stdout)?;
+    Ok(stdout.lines().filter_map(github_slug).collect())
 }
 
 // ------------------------------------------------------------------ api --
@@ -717,12 +758,34 @@ fn ensure_workflow_ref(
 /// combo names the branch the checkout must already be on — the tool
 /// verifies and refuses on a mismatch rather than switching branches;
 /// committing and promoting the file stays with the operator.
+///
+/// The checkout's repository identity, not its directory name, decides
+/// whether the write may land at all: the protected repository's own
+/// checkout refuses wherever it lives on disk, and when the run declared
+/// `--repos`/`--install-refs`/`--protect-refs` targets the checkout must
+/// belong to one of them — a directory that is not a declared target is
+/// outside the repository scope the run claimed.
 fn ensure_workflow_local(
     dir: &str,
     branch: &str,
     workflow_content: &str,
+    declared: &[&str],
     dry_run: bool,
 ) -> Result<()> {
+    let slugs = remote_slugs(dir)?;
+    anyhow::ensure!(
+        !slugs.iter().any(|slug| is_self_repo(slug)),
+        "{dir}: checkout of {} — the protected repository is not a rollout target",
+        self_repo_slug().unwrap_or_default(),
+    );
+    if !declared.is_empty() {
+        anyhow::ensure!(
+            slugs
+                .iter()
+                .any(|slug| declared.iter().any(|target| target.eq_ignore_ascii_case(slug))),
+            "{dir}: checkout is not one of the declared repository targets"
+        );
+    }
     let out = Command::new("git")
         .args(["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -1070,9 +1133,25 @@ pub fn run(argv: &[String]) -> Result<i32> {
         args.enforcement,
         if args.dry_run { " (dry-run)" } else { "" }
     );
+    // A `--local` write must land in a checkout of a repository the run
+    // actually declared — `--repos`, `--install-refs` and `--protect-refs`
+    // name the repository scope; org/user sweeps enumerate the server side
+    // and declare no local target.
+    let declared: Vec<&str> = args
+        .repos
+        .iter()
+        .map(String::as_str)
+        .chain(
+            args.install_refs
+                .iter()
+                .chain(args.protect_refs.iter())
+                .map(|(repo, _)| repo.as_str()),
+        )
+        .collect();
     let mut failures: Vec<String> = Vec::new();
     for (dir, branch) in &args.local_refs {
-        if let Err(e) = ensure_workflow_local(dir, branch, workflow_content, args.dry_run) {
+        if let Err(e) = ensure_workflow_local(dir, branch, workflow_content, &declared, args.dry_run)
+        {
             failures.push(format!("{dir}:{branch}"));
             println!("  {dir}:{branch}: FAILED: {e:#}");
         }
@@ -1307,13 +1386,14 @@ pub fn run(argv: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_dead, apply_exit, canonical_self, desired_rulesets, gh_http_status, http_outcome,
-        is_self_repo, literal_branches, parse_args, probe_needed, repo_owned, repo_slug_parts,
-        ruleset_check, ruleset_protected, ruleset_tags, self_repo_slug, split_http_status,
-        stale_action, stale_rows, urlencode, BranchVerdict, HttpOutcome, StaleAction,
-        MANAGED_RULESETS,
+        all_dead, apply_exit, canonical_self, desired_rulesets, ensure_workflow_local,
+        gh_http_status, github_slug, http_outcome, is_self_repo, literal_branches, parse_args,
+        probe_needed, remote_slugs, repo_owned, repo_slug_parts, ruleset_check, ruleset_protected,
+        ruleset_tags, self_repo_slug, split_http_status, stale_action, stale_rows, urlencode,
+        BranchVerdict, HttpOutcome, StaleAction, TempDir, MANAGED_RULESETS,
     };
     use serde_json::json;
+    use std::process::Command;
 
     /// The protected object must not carry its own protection controls:
     /// an explicit `--repos`, `--install-refs` or `--protect-refs` entry
@@ -1377,6 +1457,99 @@ mod tests {
                 && repo_slug_parts(&format!("x/../{own}")).is_err(),
             "a folded self-target must refuse before the guard compares"
         );
+    }
+
+    /// A remote URL establishes checkout identity only when it is a clean
+    /// github.com `owner/repo` spelling — another host, a local path, or a
+    /// foldable/extra segment yields no slug, so it can satisfy neither
+    /// the self check nor a declared-target match.
+    #[test]
+    fn remote_urls_resolve_to_clean_slugs_or_none() {
+        for (url, slug) in [
+            ("https://github.com/o/r", Some("o/r")),
+            ("https://github.com/o/r.git", Some("o/r")),
+            ("https://github.com/o/r/", Some("o/r")),
+            ("git@github.com:o/r.git", Some("o/r")),
+            ("ssh://git@github.com/o/r", Some("o/r")),
+            ("https://github.com/O/R", Some("O/R")),
+            ("https://github.com/o", None),
+            ("https://github.com/o/r/s", None),
+            ("https://github.com/o/../r", None),
+            ("https://github.com/o/r.git/x", None),
+            ("https://gitlab.com/o/r", None),
+            ("file:///tmp/bare", None),
+            ("not-a-url", None),
+        ] {
+            assert_eq!(github_slug(url).as_deref(), slug, "{url}");
+        }
+    }
+
+    /// `--local` writes the workflow into a repository the run never named
+    /// — unless the checkout's origin proves the target. A checkout of the
+    /// protected repository refuses wherever the directory lives, and a
+    /// checkout unrelated to the run's declared remote targets is outside
+    /// the declared repository scope; both refuse before any write, even
+    /// under `--dry-run`.
+    #[test]
+    fn local_checkout_identity_gates_the_write() {
+        let own = self_repo_slug().expect("the package names its repository");
+        let checkout = |origin: Option<&str>| {
+            let dir = TempDir::private("local-checkout").expect("temp dir");
+            let path = dir.0.to_string_lossy().into_owned();
+            let init = Command::new("git")
+                .args(["init", "-b", "main", &path])
+                .output()
+                .expect("git init");
+            assert!(init.status.success(), "git init failed");
+            let commit = Command::new("git")
+                .args([
+                    "-C",
+                    &path,
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ])
+                .output()
+                .expect("git commit");
+            assert!(commit.status.success(), "git commit failed");
+            if let Some(origin) = origin {
+                let remote = Command::new("git")
+                    .args(["-C", &path, "remote", "add", "origin", origin])
+                    .output()
+                    .expect("git remote add");
+                assert!(remote.status.success(), "git remote add failed");
+            }
+            (dir, path)
+        };
+        let wf = "content";
+        // A checkout of the protected repository refuses — any declared
+        // scope, even a dry run.
+        let (_self_dir, self_path) = checkout(Some(&format!("https://github.com/{own}.git")));
+        assert!(
+            ensure_workflow_local(&self_path, "main", wf, &[], true).is_err(),
+            "the protected repository's own checkout must refuse"
+        );
+        // A declared scope binds --local to it: an unrelated checkout refuses.
+        let (_dir, path) = checkout(Some("https://github.com/other/repo"));
+        assert!(
+            ensure_workflow_local(&path, "main", wf, &["declared/repo"], true).is_err(),
+            "a checkout outside the declared targets must refuse"
+        );
+        // The declared target's own checkout proceeds to the dry-run plan.
+        assert!(ensure_workflow_local(&path, "main", wf, &["other/repo"], true).is_ok());
+        // With no declared targets any non-self checkout may take the write.
+        assert!(ensure_workflow_local(&path, "main", wf, &[], true).is_ok());
+        // A local-only checkout cannot prove identity: admissible with no
+        // declared scope, refused when the run declared one.
+        let (_bare_dir, bare_path) = checkout(None);
+        assert!(remote_slugs(&bare_path).expect("remote query").is_empty());
+        assert!(ensure_workflow_local(&bare_path, "main", wf, &[], true).is_ok());
+        assert!(ensure_workflow_local(&bare_path, "main", wf, &["other/repo"], true).is_err());
     }
 
     /// The server's resolved `full_name` is the identity check that no
