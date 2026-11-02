@@ -45,21 +45,26 @@ jobs:
           persist-credentials: false
 
       # The `release` environment's required-reviewers rule is the
-      # operator's approval gate — configuring it is a documented
-      # provisioning precondition. GITHUB_TOKEN cannot read protection
-      # rules, so the gate proves itself from this run's record instead:
-      # an enforced deployment leaves at least one approvals entry; an
-      # auto-created or unprotected environment lets this job start with
-      # none and fails here, before any authentication runs.
+      # operator's approval gate — a provisioning precondition set
+      # under Settings → Environments → release → Required reviewers.
+      # GITHUB_TOKEN cannot read protection rules, so the gate proves
+      # itself from this run's record: an enforced deployment leaves an
+      # approved review naming the environment; an auto-created or
+      # unprotected environment starts the job with none and fails
+      # here, before the crates.io authentication. Residual: GitHub
+      # re-uses the run id on 'Re-run failed jobs', so the record is
+      # run-scoped rather than attempt-scoped — a review approved on
+      # an earlier attempt still satisfies this step.
       - name: Require the recorded release approval
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           approvals=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
-            --jq 'length')
+            --jq '[.[] | select(.state == "approved")
+                   | select(any(.environments[]?; .name == "release"))] | length')
           test "$approvals" -gt 0 || {
-            echo "no release-environment approval is on record for this run" >&2
+            echo "no approved release-environment review is on record" >&2
             exit 1
           }
 

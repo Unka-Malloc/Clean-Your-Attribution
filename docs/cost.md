@@ -62,9 +62,11 @@ that exchange is bound to this workflow file, this repository, and the
 required-reviewers rule — a documented provisioning precondition —
 and GitHub itself enforces it before this job starts. The job's own
 token cannot read protection rules, so it instead refuses to run
-unless this run's deployment record shows at least one approval: a
-missing or unprotected environment lets the job start with no
-approvals on record and it fails closed before any authentication,
+unless this run's record shows an approved review naming the `release`
+environment: a missing or unprotected environment lets the job start
+with none on record and it fails closed before any authentication
+(the record is run-scoped — a 'Re-run failed jobs' attempt inherits
+the earlier attempt's approved review),
 as does a release tag that does not equal `v<Cargo.toml version>`.
 
 Trust basis, stated plainly: the `.crate` is packaged by a GitHub-hosted
