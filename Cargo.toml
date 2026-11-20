@@ -1,0 +1,22 @@
+[package]
+name = "clean-your-attribution"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Unka-Malloc/Clean-Your-Attribution"
+description = "One attribution policy, three enforcement surfaces plus a local agent switch: commit cleaning, server-side push/PR denial, fleet rollout, and turning off agents' own attribution options."
+
+[lib]
+name = "clean_your_attribution"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cya"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
